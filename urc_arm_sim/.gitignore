@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Sim output (recordings can be large; share the ones you need separately)
+recordings/
+arm_params.py.bak
+
+# Diagrams generated from the URDF / ROS tools
+urc_arm.gv
+urc_arm.pdf
+frames_*.pdf
+frames_*.gv

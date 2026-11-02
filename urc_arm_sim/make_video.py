@@ -1,0 +1,149 @@
+"""
+Render motion.mp4 for a recording folder made by sim_arm.py.
+
+    python make_video.py recordings/20261101_180000_move
+
+The sim runs this in the background after each recording; run it by hand to
+re-render. Needs matplotlib (pip install matplotlib) and ffmpeg
+(sudo apt install ffmpeg).
+
+Layout: 3D view (left), side view X-Z (top right), motor torques with the
+effort limits dashed and a moving time cursor (bottom right).
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+FPS_OUT = 30
+COLORS = ["#7f7f7f", "#1f77b4", "#d62728", "#2ca02c", "#9467bd"]   # one per joint
+MASS_COLORS = {"motor": "#ff8c1a", "extra": "#8c8c99", "payload": "#c8a165"}
+
+
+def rover_box_edges(rover):
+    nose, length, width, clear, deck = rover
+    xs, ys, zs = (nose - length, nose), (-width / 2, width / 2), (clear, deck)
+    c = np.array([[x, y, z] for x in xs for y in ys for z in zs])
+    edges = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)]
+    return [(c[a], c[b]) for a, b in edges]
+
+
+def main(folder):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FFMpegWriter
+
+    folder = Path(folder)
+    d = np.load(folder / "motion.npz")
+    t, tau, effort, sat = d["t"], d["tau"], d["effort"], d["sat"]
+    segs, pivots, masses, tcp = d["segs"], d["pivots"], d["masses"], d["tcp"]
+    kinds, kg, names = list(d["mass_kinds"]), d["mass_kg"], list(d["joint_names"])
+    rover, tt_h = d["rover"], float(d["turntable"][0])
+    title = str(d["title"])
+
+    # frames to draw at FPS_OUT
+    times = np.arange(0.0, t[-1] + 1e-9, 1.0 / FPS_OUT)
+    frames = np.searchsorted(t, times).clip(0, len(t) - 1)
+
+    # scene limits from everything that moves + rover
+    pts = np.concatenate([segs.reshape(-1, 3), tcp, masses.reshape(-1, 3) if masses.size else tcp])
+    lo = np.minimum(pts.min(0), [rover[0] - rover[1], -rover[2] / 2, 0.0])
+    hi = np.maximum(pts.max(0), [rover[0], rover[2] / 2, rover[4]])
+    ctr, half = (lo + hi) / 2, (hi - lo).max() / 2 + 0.1
+
+    fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
+    ax3 = fig.add_subplot(1, 2, 1, projection="3d")
+    axs = fig.add_subplot(2, 2, 2)
+    axt = fig.add_subplot(2, 2, 4)
+    fig.suptitle(f"{title}   ({folder.name})", fontsize=12)
+    fig.subplots_adjust(left=0.03, right=0.97, top=0.9, bottom=0.08, hspace=0.45, wspace=0.15)
+
+    # --- 3D static scene
+    for a, b in rover_box_edges(rover):
+        ax3.plot(*zip(a, b), color="0.55", lw=1)
+    ax3.plot([0, 0], [0, 0], [rover[4], tt_h], color="0.3", lw=4)
+    g = np.linspace(-half, half, 5)
+    for v in g:
+        ax3.plot([ctr[0] + v] * 2, [ctr[1] - half, ctr[1] + half], [0, 0], color="0.85", lw=0.6)
+        ax3.plot([ctr[0] - half, ctr[0] + half], [ctr[1] + v] * 2, [0, 0], color="0.85", lw=0.6)
+    ax3.set(xlim=(ctr[0] - half, ctr[0] + half), ylim=(ctr[1] - half, ctr[1] + half), zlim=(0, 2 * half),
+            xlabel="X (m)", ylabel="Y (m)", zlabel="Z (m)")
+    ax3.set_box_aspect((1, 1, 1))
+    ax3.view_init(elev=20, azim=-60)
+
+    # --- side view static scene
+    nose, length, _, clear, deck = rover
+    axs.add_patch(plt.Rectangle((nose - length, clear), length, deck - clear, color="0.85"))
+    axs.axhline(0, color="0.5", lw=1)
+    zlo = min(lo[2], 0.0) - 0.05
+    span = max(hi[0] - lo[0], hi[2] - zlo) + 0.2           # same scale on both axes
+    xc = (lo[0] + hi[0]) / 2
+    axs.set(xlim=(xc - span / 2, xc + span / 2), ylim=(zlo, hi[2] + 0.1),
+            xlabel="X (m)", ylabel="Z (m)", title="Side view (X-Z)")
+    axs.set_aspect("equal", adjustable="box")
+    axs.grid(alpha=0.3)
+
+    # --- torque plot
+    for k, n in enumerate(names):
+        if np.max(np.abs(tau[:, k])) < 0.5 and n in ("base_yaw", "gripper_yaw"):
+            continue  # skip idle yaw motors to keep the plot readable
+        axt.plot(t, tau[:, k], color=COLORS[k], lw=1.6, label=f"{n} (limit {effort[k]:g})")
+        axt.axhline(effort[k], color=COLORS[k], ls="--", lw=0.8, alpha=0.6)
+        axt.axhline(-effort[k], color=COLORS[k], ls="--", lw=0.8, alpha=0.6)
+        if sat[:, k].any():
+            axt.plot(t[sat[:, k]], tau[sat[:, k], k], "x", color=COLORS[k], ms=4)
+    ymax = max(np.abs(tau).max() * 1.2, 1.0)
+    axt.set(xlim=(0, t[-1]), ylim=(-ymax, ymax), xlabel="time (s)", ylabel="motor torque (N*m)",
+            title="Motor torques (dashed = effort limit, x = saturated)")
+    axt.legend(loc="best", fontsize=8, ncol=2)
+    axt.grid(alpha=0.3)
+    cursor = axt.axvline(0, color="k", lw=1)
+
+    # --- moving artists
+    tube3 = [ax3.plot([], [], [], color="#1f5fbf", lw=5, solid_capstyle="round")[0] for _ in range(segs.shape[1])]
+    piv3, = ax3.plot([], [], [], "o", color="#d62728", ms=6)
+    tcp3, = ax3.plot([], [], [], "o", color="#1ab31a", ms=6)
+    trail3, = ax3.plot([], [], [], color="#1ab31a", lw=1, alpha=0.7)
+    sizes = 20 + 60 * np.asarray(kg, float)
+    mcols = [MASS_COLORS.get(k, "#888888") for k in kinds]
+    m0 = masses[0] if masses.size else np.zeros((0, 3))
+    mass3 = ax3.scatter(m0[:, 0], m0[:, 1], m0[:, 2], s=sizes, c=mcols, edgecolors="k", depthshade=False)
+    tubes = [axs.plot([], [], color="#1f5fbf", lw=4, solid_capstyle="round")[0] for _ in range(segs.shape[1])]
+    pivs, = axs.plot([], [], "o", color="#d62728", ms=5)
+    tcps, = axs.plot([], [], "o", color="#1ab31a", ms=5)
+    trails, = axs.plot([], [], color="#1ab31a", lw=1, alpha=0.7)
+    masss = axs.scatter(m0[:, 0], m0[:, 2], s=sizes, c=mcols, edgecolors="k", zorder=3)
+    clock = ax3.text2D(0.02, 0.95, "", transform=ax3.transAxes)
+    writer = FFMpegWriter(fps=FPS_OUT, bitrate=4000)
+    out = folder / "motion.mp4"
+    with writer.saving(fig, str(out), dpi=100):
+        for n, i in enumerate(frames):
+            for s, (a, b) in enumerate(segs[i]):
+                tube3[s].set_data_3d(*zip(a, b))
+                tubes[s].set_data([a[0], b[0]], [a[2], b[2]])
+            piv3.set_data_3d(pivots[i, :, 0], pivots[i, :, 1], pivots[i, :, 2])
+            pivs.set_data(pivots[i, :, 0], pivots[i, :, 2])
+            tcp3.set_data_3d([tcp[i, 0]], [tcp[i, 1]], [tcp[i, 2]])
+            tcps.set_data([tcp[i, 0]], [tcp[i, 2]])
+            trail3.set_data_3d(tcp[: i + 1, 0], tcp[: i + 1, 1], tcp[: i + 1, 2])
+            trails.set_data(tcp[: i + 1, 0], tcp[: i + 1, 2])
+            if masses.size:
+                m = masses[i]
+                mass3._offsets3d = (m[:, 0], m[:, 1], m[:, 2])
+                masss.set_offsets(m[:, [0, 2]])
+            cursor.set_xdata([t[i], t[i]])
+            clock.set_text(f"t = {t[i]:.2f} s")
+            writer.grab_frame()
+    print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    try:
+        main(sys.argv[1])
+    except ModuleNotFoundError as e:
+        sys.exit(f"{e}. Install it with:  pip install matplotlib")
+    except FileNotFoundError as e:
+        sys.exit(f"{e}\nIs ffmpeg installed?  sudo apt install ffmpeg")
