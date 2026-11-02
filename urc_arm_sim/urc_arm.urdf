@@ -30,43 +30,48 @@
       <origin xyz="-0.15 0 0.325" rpy="0 0 0"/>
       <geometry><box size="1 0.8 0.35"/></geometry>
     </collision>
-    <visual name="mount_post">
-      <origin xyz="0 0 0.525" rpy="0 0 0"/>
-      <geometry><cylinder radius="0.04" length="0.05"/></geometry>
+    <visual name="rail">
+      <origin xyz="0 0 0.51" rpy="0 0 0"/>
+      <geometry><box size="0.06 0.9 0.02"/></geometry>
       <material name="post"/>
     </visual>
-    <visual name="motor_base_yaw">
-      <origin xyz="0 0 0.49" rpy="0 0 0"/>
+    <visual name="motor_base">
+      <origin xyz="0 -0.45 0.53" rpy="1.5708 0 0"/>
       <geometry><cylinder radius="0.045" length="0.1"/></geometry>
       <material name="motor"/>
     </visual>
   </link>
-  <joint name="base_yaw" type="revolute">
+  <joint name="base_slide" type="prismatic">
     <parent link="rover"/>
-    <child link="turntable"/>
+    <child link="carriage"/>
     <origin xyz="0 0 0.55" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-3.14159" upper="3.14159" effort="40" velocity="1.0472"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.35" upper="0.35" effort="200" velocity="0.15"/>
   </joint>
-  <link name="turntable">
+  <link name="carriage">
+    <visual name="mount_post">
+      <origin xyz="0 0 -0.025" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.04" length="0.05"/></geometry>
+      <material name="post"/>
+    </visual>
     <inertial>
-      <origin xyz="0 -0.0423529 0.0450118" rpy="0 0 0"/>
-      <mass value="1.7"/>
-      <inertia ixx="0.00451155" ixy="0" ixz="0" iyy="0.00303846" iyz="0.00105035" izz="0.00456409"/>
+      <origin xyz="0 -0.0327273 0.0234182" rpy="0 0 0"/>
+      <mass value="2.2"/>
+      <inertia ixx="0.00884656" ixy="0" ixz="0" iyy="0.00668042" iyz="0.00260509" izz="0.00713214"/>
     </inertial>
     <visual name="motor_shoulder">
       <origin xyz="0 -0.06 0.0596" rpy="1.5708 0 0"/>
       <geometry><cylinder radius="0.045" length="0.09"/></geometry>
       <material name="motor"/>
     </visual>
-    <visual name="turntable_plate">
-      <origin xyz="0 0 0.01" rpy="0 0 0"/>
-      <geometry><box size="0.15 0.15 0.02"/></geometry>
+    <visual name="carriage">
+      <origin xyz="0 0 -0.02" rpy="0 0 0"/>
+      <geometry><box size="0.15 0.15 0.04"/></geometry>
       <material name="extra"/>
     </visual>
   </link>
   <joint name="shoulder" type="revolute">
-    <parent link="turntable"/>
+    <parent link="carriage"/>
     <child link="link1"/>
     <origin xyz="0 0 0.0596" rpy="0 0 0"/>
     <axis xyz="0 -1 0"/>
@@ -107,9 +112,9 @@
   </joint>
   <link name="link2">
     <inertial>
-      <origin xyz="0.579719 -0.0152113 0" rpy="0 0 0"/>
+      <origin xyz="0.579719 0.0552113 0" rpy="0 0 0"/>
       <mass value="1.05185"/>
-      <inertia ixx="0.000711412" ixy="0.0041645" ixz="0" iyy="0.0822889" iyz="0" izz="0.0827155"/>
+      <inertia ixx="0.000711412" ixy="-0.0041645" ixz="0" iyy="0.0822889" iyz="0" izz="0.0827155"/>
     </inertial>
     <visual name="elbow_axis">
       <origin xyz="0 0 0" rpy="1.5708 0 0"/>
@@ -117,16 +122,16 @@
       <material name="pivot"/>
     </visual>
     <visual name="link2_tube">
-      <origin xyz="0.42 0 0" rpy="0 0 0"/>
+      <origin xyz="0.42 0.04 0" rpy="0 0 0"/>
       <geometry><box size="0.84 0.0254 0.0254"/></geometry>
       <material name="tube"/>
     </visual>
     <collision name="link2_tube">
-      <origin xyz="0.42 0 0" rpy="0 0 0"/>
+      <origin xyz="0.42 0.04 0" rpy="0 0 0"/>
       <geometry><box size="0.84 0.0254 0.0254"/></geometry>
     </collision>
     <visual name="motor_wrist_pitch">
-      <origin xyz="0.84 -0.04 0" rpy="1.5708 0 0"/>
+      <origin xyz="0.84 0.08 0" rpy="1.5708 0 0"/>
       <geometry><cylinder radius="0.03" length="0.06"/></geometry>
       <material name="motor"/>
     </visual>
@@ -134,7 +139,7 @@
   <joint name="wrist_pitch" type="revolute">
     <parent link="link2"/>
     <child link="wrist"/>
-    <origin xyz="0.84 0 0" rpy="0 0 0"/>
+    <origin xyz="0.84 0.04 0" rpy="0 0 0"/>
     <axis xyz="0 -1 0"/>
     <limit lower="-3.14159" upper="3.14159" effort="20" velocity="1.5708"/>
   </joint>

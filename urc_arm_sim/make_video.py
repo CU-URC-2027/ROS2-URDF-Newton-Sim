@@ -40,7 +40,11 @@ def main(folder):
     segs, pivots, masses, tcp = d["segs"], d["pivots"], d["masses"], d["tcp"]
     kinds, kg, names = list(d["mass_kinds"]), d["mass_kg"], list(d["joint_names"])
     rover, tt_h = d["rover"], float(d["turntable"][0])
+    base_pos = d["base_pos"] if "base_pos" in d.files else np.tile([0.0, 0.0, tt_h], (len(t), 1))
+    prismatic = d["prismatic"] if "prismatic" in d.files else np.zeros(len(names), bool)
     title = str(d["title"])
+    coll_seg = d["coll_seg"] if "coll_seg" in d.files else np.zeros((len(t), segs.shape[1]), bool)
+    coll_text = d["coll_text"] if "coll_text" in d.files else np.array([""] * len(t))
 
     # frames to draw at FPS_OUT
     times = np.arange(0.0, t[-1] + 1e-9, 1.0 / FPS_OUT)
@@ -62,12 +66,15 @@ def main(folder):
     # --- 3D static scene
     for a, b in rover_box_edges(rover):
         ax3.plot(*zip(a, b), color="0.55", lw=1)
-    ax3.plot([0, 0], [0, 0], [rover[4], tt_h], color="0.3", lw=4)
+    post3, = ax3.plot([0, 0], [0, 0], [rover[4], tt_h], color="0.3", lw=4)     # mount post (moves on a slide)
+    if prismatic.any():                                                      # rail on the deck
+        y_lo, y_hi = base_pos[:, 1].min(), base_pos[:, 1].max()
+        ax3.plot([0, 0], [min(y_lo, -0.3) - 0.1, max(y_hi, 0.3) + 0.1], [rover[4]] * 2, color="0.35", lw=2)
     g = np.linspace(-half, half, 5)
     for v in g:
         ax3.plot([ctr[0] + v] * 2, [ctr[1] - half, ctr[1] + half], [0, 0], color="0.85", lw=0.6)
         ax3.plot([ctr[0] - half, ctr[0] + half], [ctr[1] + v] * 2, [0, 0], color="0.85", lw=0.6)
-    ax3.set(xlim=(ctr[0] - half, ctr[0] + half), ylim=(ctr[1] - half, ctr[1] + half), zlim=(0, 2 * half),
+    ax3.set(xlim=(ctr[0] - half, ctr[0] + half), ylim=(ctr[1] - half, ctr[1] + half), zlim=(min(lo[2], 0.0), min(lo[2], 0.0) + 2 * half),
             xlabel="X (m)", ylabel="Y (m)", zlabel="Z (m)")
     ax3.set_box_aspect((1, 1, 1))
     ax3.view_init(elev=20, azim=-60)
@@ -86,19 +93,24 @@ def main(folder):
 
     # --- torque plot
     for k, n in enumerate(names):
-        if np.max(np.abs(tau[:, k])) < 0.5 and n in ("base_yaw", "gripper_yaw"):
-            continue  # skip idle yaw motors to keep the plot readable
-        axt.plot(t, tau[:, k], color=COLORS[k], lw=1.6, label=f"{n} (limit {effort[k]:g})")
+        if np.max(np.abs(tau[:, k])) < 0.5 and n in ("base_yaw", "base_slide", "gripper_yaw"):
+            continue  # skip idle base / yaw motors to keep the plot readable
+        unit = "N" if prismatic[k] else "N*m"
+        axt.plot(t, tau[:, k], color=COLORS[k], lw=1.6, label=f"{n} (limit {effort[k]:g} {unit})")
         axt.axhline(effort[k], color=COLORS[k], ls="--", lw=0.8, alpha=0.6)
         axt.axhline(-effort[k], color=COLORS[k], ls="--", lw=0.8, alpha=0.6)
         if sat[:, k].any():
             axt.plot(t[sat[:, k]], tau[sat[:, k], k], "x", color=COLORS[k], ms=4)
     ymax = max(np.abs(tau).max() * 1.2, 1.0)
-    axt.set(xlim=(0, t[-1]), ylim=(-ymax, ymax), xlabel="time (s)", ylabel="motor torque (N*m)",
+    axt.set(xlim=(0, t[-1]), ylim=(-ymax, ymax), xlabel="time (s)", ylabel="torque (N*m) / slide force (N)",
             title="Motor torques (dashed = effort limit, x = saturated)")
     axt.legend(loc="best", fontsize=8, ncol=2)
     axt.grid(alpha=0.3)
     cursor = axt.axvline(0, color="k", lw=1)
+    hit = np.array([bool(x) for x in coll_text])
+    if hit.any():
+        axt.fill_between(t, -ymax, ymax, where=hit, color="#d62728", alpha=0.12, step="mid", label="collision")
+        axt.legend(loc="best", fontsize=8, ncol=2)
 
     # --- moving artists
     tube3 = [ax3.plot([], [], [], color="#1f5fbf", lw=5, solid_capstyle="round")[0] for _ in range(segs.shape[1])]
@@ -115,13 +127,19 @@ def main(folder):
     trails, = axs.plot([], [], color="#1ab31a", lw=1, alpha=0.7)
     masss = axs.scatter(m0[:, 0], m0[:, 2], s=sizes, c=mcols, edgecolors="k", zorder=3)
     clock = ax3.text2D(0.02, 0.95, "", transform=ax3.transAxes)
+    coll_lbl = fig.text(0.5, 0.93, "", ha="center", color="#d62728", fontsize=11, fontweight="bold")
     writer = FFMpegWriter(fps=FPS_OUT, bitrate=4000)
     out = folder / "motion.mp4"
     with writer.saving(fig, str(out), dpi=100):
         for n, i in enumerate(frames):
+            bp = base_pos[i]
+            post3.set_data_3d([bp[0], bp[0]], [bp[1], bp[1]], [rover[4], bp[2]])
             for s, (a, b) in enumerate(segs[i]):
+                col = "#d62728" if s < coll_seg.shape[1] and coll_seg[i, s] else "#1f5fbf"
                 tube3[s].set_data_3d(*zip(a, b))
                 tubes[s].set_data([a[0], b[0]], [a[2], b[2]])
+                tube3[s].set_color(col)
+                tubes[s].set_color(col)
             piv3.set_data_3d(pivots[i, :, 0], pivots[i, :, 1], pivots[i, :, 2])
             pivs.set_data(pivots[i, :, 0], pivots[i, :, 2])
             tcp3.set_data_3d([tcp[i, 0]], [tcp[i, 1]], [tcp[i, 2]])
@@ -134,6 +152,7 @@ def main(folder):
                 masss.set_offsets(m[:, [0, 2]])
             cursor.set_xdata([t[i], t[i]])
             clock.set_text(f"t = {t[i]:.2f} s")
+            coll_lbl.set_text(f"COLLISION: {coll_text[i]}" if coll_text[i] else "")
             writer.grab_frame()
     print(f"wrote {out}")
 

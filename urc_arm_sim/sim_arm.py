@@ -1,5 +1,5 @@
 """
-Newton sim of the URC arm (3-DOF pitch arm + base turntable).
+Newton sim of the URC arm (3-DOF pitch arm on a sliding base, or a turntable).
 
     python sim_arm.py             # opens the viewer (builds the model from arm_params.py)
 
@@ -80,8 +80,10 @@ class Example:
         self.cmd, self.cmd_qd = q0.copy(), np.zeros(5)
         self.move_from, self.move_to = q0.copy(), q0.copy()
         self.move_t, self.move_T = 0.0, 1.0
-        self.slider_deg = np.degrees(q0)
+        self.names = [am.joint_name(self.P, j) for j in am.JOINT_ORDER]   # e.g. base_slide
+        self.slider_val = self._disp(q0)
 
+        self.check_coll = True        # collision checking (readout, red overlay, IK rejection)
         self._build_model(q0)
 
         nose = self.P.ROVER["mount_behind_front"]
@@ -117,8 +119,9 @@ class Example:
         dof = {}
         for ji, key in enumerate(builder.joint_label):
             name = key.split("/")[-1]
-            if name in am.JOINT_ORDER:
-                dof[name] = builder.joint_qd_start[ji]
+            internal = {am.joint_name(P, j): j for j in am.JOINT_ORDER}
+            if name in internal:
+                dof[internal[name]] = builder.joint_qd_start[ji]
         self.idx = np.array([dof[j] for j in am.JOINT_ORDER])
         for k, j in enumerate(am.JOINT_ORDER):
             d = dof[j]
@@ -137,16 +140,16 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         self.target_full = self.control.joint_target_q.numpy().copy()
         mj = self.solver.mj_model                    # MuJoCo DOF index of each of our joints
-        self.mj_dof = np.array([mj.jnt_dofadr[next(i for i in range(mj.njnt) if mj.joint(i).name.endswith(j))]
+        self.mj_dof = np.array([mj.jnt_dofadr[next(i for i in range(mj.njnt) if mj.joint(i).name.endswith(am.joint_name(P, j)))]
                                 for j in am.JOINT_ORDER])
         self.tau_frame = None
 
         self.parts = am.body_parts(P)
+        self.coll_elems = am.collision_elements(P, self.parts)
+        self.hits = []
         self.inertials = am.body_inertials(P, self.parts)
-        self.effort = np.array([P.JOINTS[j][2] for j in am.JOINT_ORDER])
-        self.vmax = np.radians([P.JOINTS[j][3] for j in am.JOINT_ORDER])
-        self.lo = np.radians([P.JOINTS[j][0] for j in am.JOINT_ORDER])
-        self.hi = np.radians([P.JOINTS[j][1] for j in am.JOINT_ORDER])
+        lim = np.array([am.joint_limits(P, j) for j in am.JOINT_ORDER])   # SI: rad or m
+        self.lo, self.hi, self.effort, self.vmax = lim[:, 0], lim[:, 1], lim[:, 2], lim[:, 3]
         self.viewer.set_model(self.model)
 
     def rebuild(self):
@@ -161,22 +164,43 @@ class Example:
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(lambda ui, ex=self: ex.gui(ui), position="side")
 
+    # ================================================================ units
+    def _disp(self, q):
+        """SI joint vector -> display units (deg, or m for a slide)."""
+        return np.array([am.from_si(self.P, j, v) for j, v in zip(am.JOINT_ORDER, q)])
+
+    def _si(self, v):
+        return np.array([am.to_si(self.P, j, x) for j, x in zip(am.JOINT_ORDER, v)])
+
+    def _fmt_pose(self, q):
+        out = []
+        for j, n, v in zip(am.JOINT_ORDER, self.names, self._disp(q)):
+            u = am.joint_units(self.P, j)[0]
+            out.append(f"{n} {v:.3f} m" if u == "m" else f"{n} {v:.1f}")
+        return ", ".join(out)
+
     # ================================================================ motion
     def go_to(self, q_goal, label=""):
         q_goal = np.clip(np.array(q_goal, float), self.lo, self.hi)
         dq = np.abs(q_goal - self.cmd)
         self.move_T = max(0.3, float(np.max(1.875 * dq / self.vmax)))   # quintic peak speed = 1.875 dq / T
         self.move_from, self.move_to, self.move_t = self.cmd.copy(), q_goal, 0.0
-        self.slider_deg = np.degrees(q_goal)
+        self.slider_val = self._disp(q_goal)
         if self.rec_phase is None:
             self.status = f"moving to {label} ({self.move_T:.1f} s)" if label else f"moving ({self.move_T:.1f} s)"
 
     def moving(self):
         return self.move_t < self.move_T
 
+    def _coll_fn(self):
+        if not self.check_coll:
+            return None
+        return lambda q: am.check_collisions(self.P, q, self.coll_elems)
+
     def solve_ik(self, target, label="IK target"):
         x, y, z, pitch = target
-        q, msg = am.ik(self.P, (x, y, z), pitch, 0.0, "up" if self.elbow_up else "down", self.cmd)
+        q, msg = am.ik(self.P, (x, y, z), pitch, 0.0, "up" if self.elbow_up else "down", self.cmd,
+                       self._coll_fn())
         if q is None:
             self.status = f"{label}: {msg}"
             return None
@@ -193,8 +217,9 @@ class Example:
             self.status = f"{name}: unknown preset '{tgt}'"
             return None
         if isinstance(tgt, dict):
-            return np.radians(np.array(tgt["joints_deg"], float))
-        q, msg = am.ik(self.P, tgt[:3], tgt[3], 0.0, "up" if self.elbow_up else "down", self.cmd)
+            return self._si(tgt["joints_deg"])
+        q, msg = am.ik(self.P, tgt[:3], tgt[3], 0.0, "up" if self.elbow_up else "down", self.cmd,
+                       self._coll_fn())
         if q is None:
             self.status = f"{name}: {msg}"
         return None if q is None else np.array(q)
@@ -227,6 +252,11 @@ class Example:
         self.sim_time += self.frame_dt
         if self.rec_phase is None and not self.moving() and self.status.startswith("moving"):
             self.status = "holding"
+        if self.check_coll:
+            q, _ = self.joint_state()
+            self.hits = am.check_collisions(self.P, q, self.coll_elems)
+        else:
+            self.hits = []
         self._record_step()
 
     def joint_state(self):
@@ -272,7 +302,8 @@ class Example:
         sk = am.skeleton(self.P, q, self.parts)
         self.rec_log.append(dict(
             t=self.sim_time - self.rec_t0, cmd=self.cmd.copy(), q=q, qd=qd, tau=tau, sat=sat,
-            static=am.static_torques(self.P, q, self.inertials), tcp=sk["tcp"],
+            static=am.static_torques(self.P, q, self.inertials), tcp=sk["tcp"], hits=list(self.hits),
+            base_pos=sk["base_pos"].copy(),
             segs=np.array(sk["segments"]), pivots=sk["pivots"], masses=np.array([m[2] for m in sk["masses"]])))
         if not self.moving():
             self.rec_settle += self.frame_dt
@@ -292,38 +323,53 @@ class Example:
         folder.mkdir(parents=True, exist_ok=True)
 
         t = np.array([r["t"] for r in log])
-        Q = np.degrees([r["q"] for r in log])
-        C = np.degrees([r["cmd"] for r in log])
-        QD = np.degrees([r["qd"] for r in log])
+        Q = np.array([self._disp(r["q"]) for r in log])
+        C = np.array([self._disp(r["cmd"]) for r in log])
+        QD = np.array([self._disp(r["qd"]) for r in log])
         TAU = np.array([r["tau"] for r in log])
         ST = np.array([r["static"] for r in log])
         SAT = np.array([r["sat"] for r in log])
+        HITS = [r["hits"] for r in log]
         TCP = np.array([r["tcp"] for r in log])
 
         with open(folder / "torques.csv", "w", newline="") as fh:
             w = csv.writer(fh)
             head = ["time_s"]
-            for j in am.JOINT_ORDER:
-                head += [f"{j}_cmd_deg", f"{j}_deg", f"{j}_vel_deg_s", f"{j}_torque_Nm",
-                         f"{j}_static_Nm", f"{j}_saturated"]
-            w.writerow(head + ["tcp_x_m", "tcp_y_m", "tcp_z_m"])
+            for j, n in zip(am.JOINT_ORDER, self.names):
+                u = am.joint_units(P, j)[0]
+                f_ = "force_N" if u == "m" else "torque_Nm"
+                s_ = "static_N" if u == "m" else "static_Nm"
+                head += [f"{n}_cmd_{u}", f"{n}_{u}", f"{n}_vel_{u}_s", f"{n}_{f_}", f"{n}_{s_}", f"{n}_saturated"]
+            w.writerow(head + ["tcp_x_m", "tcp_y_m", "tcp_z_m", "collision"])
             for i in range(len(t)):
                 row = [f"{t[i]:.4f}"]
                 for k in range(5):
                     row += [f"{C[i,k]:.3f}", f"{Q[i,k]:.3f}", f"{QD[i,k]:.3f}", f"{TAU[i,k]:.3f}",
                             f"{ST[i,k]:.3f}", int(SAT[i, k])]
-                w.writerow(row + [f"{v:.4f}" for v in TCP[i]])
+                w.writerow(row + [f"{v:.4f}" for v in TCP[i]] +
+                           ["; ".join(f"{a} hits {b}" for a, b in HITS[i]) if HITS[i] else ""])
 
         lines = [f"Recording '{self.rec_name}'  {dt.datetime.now():%Y-%m-%d %H:%M:%S}",
                  f"Duration {t[-1]:.2f} s, {len(t)} frames at {self.fps} fps",
                  f"L1 {P.L1} m, L2 {P.L2} m, gripper {P.L_GRIPPER} m, payload {P.PAYLOAD['mass']} kg",
-                 "Start (deg): " + ", ".join(f"{j} {v:.1f}" for j, v in zip(am.JOINT_ORDER, np.degrees(self.rec_start))),
-                 "End   (deg): " + ", ".join(f"{j} {v:.1f}" for j, v in zip(am.JOINT_ORDER, np.degrees(self.rec_end))),
+                 "Start (deg; slide in m): " + self._fmt_pose(self.rec_start),
+                 "End   (deg; slide in m): " + self._fmt_pose(self.rec_end),
                  "", f"{'motor':12s} {'peak |tau|':>10s} {'at t (s)':>9s} {'static peak':>11s} {'limit':>7s}  saturated"]
-        for k, j in enumerate(am.JOINT_ORDER):
+        for k, j in enumerate(self.names):
             i = int(np.argmax(np.abs(TAU[:, k])))
             lines.append(f"{j:12s} {abs(TAU[i,k]):10.2f} {t[i]:9.2f} {np.max(np.abs(ST[:,k])):11.2f} "
                          f"{self.effort[k]:7.1f}  {'YES' if SAT[:,k].any() else 'no'}")
+        lines += ["", "Collisions" + ("" if self.check_coll else " (checking was OFF)") + ":"]
+        events, start = [], None
+        for i in range(len(t) + 1):
+            hit = i < len(t) and bool(HITS[i])
+            if hit and start is None:
+                start = i
+            if not hit and start is not None:
+                pairs = sorted({f"{a} hits {b}" for k in range(start, i) for a, b in HITS[k]})
+                events.append(f"  {t[start]:.2f} - {t[i - 1]:.2f} s: " + "; ".join(pairs))
+                start = None
+        lines += events or ["  none"]
         (folder / "summary.txt").write_text("\n".join(lines) + "\n")
 
         kinds = [m[0] for m in am.skeleton(P, log[0]["q"], self.parts)["masses"]]
@@ -332,10 +378,15 @@ class Example:
             folder / "motion.npz", t=t, tau=TAU, static=ST, sat=SAT, effort=self.effort, tcp=TCP,
             segs=np.array([r["segs"] for r in log]), pivots=np.array([r["pivots"] for r in log]),
             masses=np.array([r["masses"] for r in log]), mass_kinds=np.array(kinds), mass_kg=np.array(masses_kg),
-            joint_names=np.array(am.JOINT_ORDER), title=np.array(self.rec_name),
+            joint_names=np.array(self.names), title=np.array(self.rec_name),
+            prismatic=np.array([am.is_prismatic(P, j) for j in am.JOINT_ORDER]),
+            base_pos=np.array([r["base_pos"] for r in log]),
             rover=np.array([P.ROVER[k] for k in ("mount_behind_front", "length", "width",
                                                   "ground_clearance", "deck_height")]),
-            turntable=np.array([P.TURNTABLE_HEIGHT]))
+            turntable=np.array([P.BASE_HEIGHT]),
+            coll_seg=np.array([[any(n in pair for pair in h) for n in ("link1 tube", "link2 tube", "gripper")]
+                               for h in HITS]),
+            coll_text=np.array([am.describe_hits(h, 2) if h else "" for h in HITS]))
         self.last_recording = folder
         if make_video:
             subprocess.Popen([sys.executable, str(HERE / "make_video.py"), str(folder)],
@@ -356,8 +407,8 @@ class Example:
                     holder[key][idx] = tuple(v)
             return setter
 
-        items.append(("shoulder pivot (from turntable centre)", lambda: P.SHOULDER_PIVOT,
-                      lambda v: setattr(P, "SHOULDER_PIVOT", tuple(v)), ("turntable", "pivot")))
+        items.append(("shoulder pivot (from base centre)", lambda: P.SHOULDER_PIVOT,
+                      lambda v: setattr(P, "SHOULDER_PIVOT", tuple(v)), ("base", "pivot")))
         for link, near_lbl, far_lbl in (("link1", "shoulder", "elbow"), ("link2", "elbow", "wrist")):
             g = P.LINK_GEOMETRY[link]
             items.append((f"{link}: {near_lbl} pivot (from tube start)", (lambda g=g: g["near"]),
@@ -426,10 +477,47 @@ class Example:
         self._design_drawn = True
 
     # ================================================================ render + GUI
+    def _draw_collisions(self):
+        """Red overlay on the parts that are touching something."""
+        if not hasattr(self.viewer, "log_lines"):
+            return
+        if not self.hits and not getattr(self, "_coll_drawn", False):
+            return
+        dev = self.model.device
+        names = {n for pair in self.hits for n in pair}
+        q, _ = self.joint_state()
+        frames = am.fk(self.P, q)[0]
+        segs, pts, rad = [], [], []
+        for el in self.coll_elems:
+            if el["name"] not in names:
+                continue
+            R, p = frames[el["body"]]
+            if el["kind"] == "capsule":
+                segs.append((p + R @ el["a"], p + R @ el["b"]))
+            else:
+                pts.append(p + R @ el["c"])
+                rad.append(el["r"] if "r" in el else float(np.max(el["h"])))
+        red = wp.vec3(1.0, 0.1, 0.1)
+        if segs:
+            self.viewer.log_lines("/collisions", wp.array([a for a, _ in segs], dtype=wp.vec3, device=dev),
+                                  wp.array([b for _, b in segs], dtype=wp.vec3, device=dev),
+                                  wp.array([red] * len(segs), dtype=wp.vec3, device=dev), hidden=False)
+        elif getattr(self, "_coll_drawn", False):
+            self.viewer.log_lines("/collisions", None, None, None, hidden=True)
+        if hasattr(self.viewer, "log_points"):
+            if pts:
+                self.viewer.log_points("/collision_parts", wp.array(pts, dtype=wp.vec3, device=dev),
+                                       wp.array([r * 1.05 for r in rad], dtype=wp.float32, device=dev),
+                                       wp.array([red] * len(pts), dtype=wp.vec3, device=dev), hidden=False)
+            elif getattr(self, "_coll_drawn", False):
+                self.viewer.log_points("/collision_parts", None)
+        self._coll_drawn = bool(self.hits)
+
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self._draw_design_box()
+        self._draw_collisions()
         self.viewer.end_frame()
 
     def _slider_box(self, ui, label, v, lo, hi, fmt="%.3f"):
@@ -449,18 +537,23 @@ class Example:
     def gui(self, ui):
         P = self.P
         ui.text_wrapped(f"Status: {self.status}")
+        ch, self.check_coll = ui.checkbox("Check collisions##coll", self.check_coll)
+        if ch and not self.check_coll:
+            self.hits = []
         ui.separator()
 
         busy = self.rec_phase is not None
-        ui.text("Joints (relative deg)")
+        ui.text("Joints (relative deg; slide in m)")
         changed_any = False
         for k, j in enumerate(am.JOINT_ORDER):
-            v, ch, _ = self._slider_box(ui, f"{j}##jt", self.slider_deg[k], P.JOINTS[j][0], P.JOINTS[j][1], "%.1f")
+            lo, hi = am.from_si(P, j, self.lo[k]), am.from_si(P, j, self.hi[k])
+            fmt = "%.3f" if am.is_prismatic(P, j) else "%.1f"
+            v, ch, _ = self._slider_box(ui, f"{self.names[k]}##jt", self.slider_val[k], lo, hi, fmt)
             if ch and not busy:
-                self.slider_deg[k] = float(np.clip(v, P.JOINTS[j][0], P.JOINTS[j][1]))
+                self.slider_val[k] = float(np.clip(v, lo, hi))
                 changed_any = True
         if changed_any:
-            self.go_to(np.radians(self.slider_deg), "slider pose")
+            self.go_to(self._si(self.slider_val), "slider pose")
 
         ui.text("Presets")
         for name in self.presets:
@@ -482,8 +575,8 @@ class Example:
                 self.solve_ik(list(t))
 
         if ui.collapsing_header("Record move"):
-            ui.text("Start: " + " ".join(f"{v:.0f}" for v in np.degrees(self.rec_start)))
-            ui.text("End:   " + " ".join(f"{v:.0f}" for v in np.degrees(self.rec_end)))
+            ui.text_wrapped("Start: " + self._fmt_pose(self.rec_start))
+            ui.text_wrapped("End:   " + self._fmt_pose(self.rec_end))
             if ui.button("Set start = current pose##rec"):
                 self.rec_start = self.move_to.copy()
             ui.same_line()
@@ -545,19 +638,32 @@ class Example:
         tau, sat, q, _ = self.drive_torque()
         _, _, tcp = am.fk(P, q)
         ui.text(f"TCP x {tcp[0]:.3f}  y {tcp[1]:.3f}  z {tcp[2]:.3f} m  (past nose {tcp[0] - P.ROVER['mount_behind_front']:.3f})")
-        ui.text("Torque N*m:   motor | static | limit")
+        if not self.check_coll:
+            ui.text("Collisions: not checked")
+        elif self.hits:
+            ui.push_text_wrap_pos(0.0)
+            ui.text_colored(ui.ImVec4(1.0, 0.3, 0.3, 1.0), "COLLISION: " + am.describe_hits(self.hits, 4))
+            ui.pop_text_wrap_pos()
+        else:
+            ui.text_colored(ui.ImVec4(0.4, 0.9, 0.4, 1.0), "Collisions: clear")
+        ui.text("Torque N*m (slide: force N):  motor | static | limit")
         static = am.static_torques(P, q, self.inertials)
+        pos = self._disp(q)
         for k, j in enumerate(am.JOINT_ORDER):
-            ui.text(f"  {j:11s} {tau[k]:7.2f} | {static[k]:7.2f} | {self.effort[k]:6.1f}{'  SAT' if sat[k] else ''}")
+            unit = am.joint_units(P, j)[0]
+            where = f"{pos[k]:+.3f} m" if unit == "m" else f"{pos[k]:+6.1f} deg"
+            ui.text(f"  {self.names[k]:11s} {where:>11s}  {tau[k]:7.2f} | {static[k]:7.2f} | "
+                    f"{self.effort[k]:6.1f}{'  SAT' if sat[k] else ''}")
 
     # ================================================================ headless check
     def test_final(self):
         """Hold the home pose: motor torque must match the static model."""
         tau, sat, q, _ = self.drive_torque()
         static = am.static_torques(self.P, q, self.inertials)
-        print("joint        motor   static   q_err(deg)")
-        for k, j in enumerate(am.JOINT_ORDER):
-            print(f"  {j:11s} {tau[k]:7.3f} {static[k]:7.3f}  {math.degrees(self.cmd[k] - q[k]):7.3f}")
+        print("joint        motor   static   error (deg; slide in m)")
+        err = self._disp(self.cmd) - self._disp(q)
+        for k in range(len(am.JOINT_ORDER)):
+            print(f"  {self.names[k]:11s} {tau[k]:7.3f} {static[k]:7.3f}  {err[k]:9.4f}")
         if not np.all(np.isfinite(q)):
             raise ValueError("non-finite joint state")
         if np.max(np.abs(tau - static)) > 0.05 * max(1.0, np.max(np.abs(static))):

@@ -6,9 +6,11 @@ torques** before hardware is built. It runs in
 engine built on MuJoCo) and generates a **URDF** robot description of the
 arm.
 
-The arm: a **base turntable** (yaw), **shoulder**, **elbow** and **wrist**
-(pitch), and a **gripper yaw**. Link 1 = 1.0 m and link 2 = 0.84 m axis to
-axis, gripper 0.15 m. It is the successor to the team's MATLAB arm sim and
+The arm: a **sliding base** that moves the whole arm left/right across the
+rover (a prismatic joint along Y, ±0.35 m), **shoulder**, **elbow** and
+**wrist** (pitch), and a **gripper yaw**. Link 1 = 1.0 m and link 2 = 0.84 m
+axis to axis, gripper 0.15 m. A turntable (yaw) base is available instead
+with one setting (`BASE_JOINT`, 4.6). It is the successor to the team's MATLAB arm sim and
 uses the same coordinate conventions.
 
 Everything about the arm (lengths, tubes, motors, masses, joint limits,
@@ -34,8 +36,8 @@ presets) lives in **one file, `arm_params.py`**.
 | File | What it is |
 |---|---|
 | `arm_params.py` | **The file you edit.** Lengths, tube section and material, pivot offsets, joint limits / effort / speed, motors, extra masses, COM overrides, payload, home pose, preset targets. |
-| `sim_arm.py` | The simulation and its side panel (sliders, presets, IK, recording, design editing). |
-| `arm_model.py` | The arm's math: geometry, mass properties, forward/inverse kinematics, static torques. |
+| `sim_arm.py` | The simulation and its side panel (sliders, presets, IK, collision checking, recording, design editing). |
+| `arm_model.py` | The arm's math: geometry, mass properties, forward/inverse kinematics, static torques, collision checks. |
 | `build_urdf.py` | Writes `urc_arm.urdf` from the params and prints masses, tube lengths and holding torques. |
 | `make_video.py` | Turns a recording into an MP4 (the sim runs it automatically). |
 | `params_io.py` | Writes design changes made in the sim back into `arm_params.py`. |
@@ -172,9 +174,11 @@ python sim_arm.py
 
 ### 4.1 The 3D view
 
-The arm stands on a grey box (the rover body). Blue boxes are the link
+The arm stands on a grey box (the rover body). The dark bar across the deck
+is the slide rail, with the mount post riding on it. Blue boxes are the link
 tubes, orange cylinders are motors, grey boxes are other masses, red rods
-mark the pitch axes and the green ball is the TCP (gripper tip).
+mark the pitch axes and the green ball is the TCP (gripper tip). Parts that
+are colliding are traced in **red** (4.3).
 
 | Control | Action |
 |---|---|
@@ -195,14 +199,34 @@ box, type a value and press **Enter**.
 | Section | What it does |
 |---|---|
 | **Status** | What the sim is doing, or why something failed (e.g. "out of reach"). |
-| **Joints** | Joint angles in **relative degrees** (what each motor turns). The arm moves there smoothly, limited by each joint's speed. |
+| **Check collisions** | Turns collision checking on/off (4.3). On by default. |
+| **Joints** | `base_slide` in **metres**; the other joints in **relative degrees** (what each motor turns). The arm moves there smoothly, limited by each joint's speed. |
 | **Presets** | Buttons for saved poses. Edit `PRESETS` in `arm_params.py`. |
-| **TCP target / IK** | Type a gripper-tip position (m) and pitch (deg; −90 = pointing down, 0 = level) and press **Solve IK**. The turntable turns to face the target. **Elbow up** picks between the two arm solutions. |
-| **Record move** | Records a move from a start pose to an end pose (4.3). |
-| **Design** | Move pivots, motors and masses live and save them (4.4). |
-| **Readout** | TCP position and, for every motor: torque now, static (holding) torque, and effort limit. **SAT** = the motor is at its limit and can't hold or follow the command. |
+| **TCP target / IK** | Type a gripper-tip position (m) and pitch (deg; −90 = pointing down, 0 = level) and press **Solve IK**. The slide moves the arm sideways to line up with the target's Y (a turntable base turns to face it instead). **Elbow up** picks between the two arm solutions; if one collides, the other is used. |
+| **Record move** | Records a move from a start pose to an end pose (4.4). |
+| **Design** | Move pivots, motors and masses live and save them (4.5). |
+| **Readout** | TCP position; **collision status** (green "clear" or red "COLLISION: …"); and for every motor: position, torque now (slide: force in N), static (holding) torque, and effort limit. **SAT** = the motor is at its limit and can't hold or follow the command. |
 
-### 4.3 Recording a move
+### 4.3 Collision checking
+
+The sim checks every frame whether any part of the arm touches the **ground**,
+the **rover body**, the **mount post**, a motor on the rover, or **another
+part of the arm**. It warns rather than blocking: the arm still moves, but
+
+* the readout shows what is hitting what, e.g. `COLLISION: link2 tube hits rover body`;
+* the colliding parts are traced in red in the 3D view;
+* the IK and presets skip solutions that collide (and say so);
+* recordings log collisions per frame (4.4).
+
+The checks use simple shapes: tubes and the gripper are capsules (radius =
+half the larger tube side), motors and extra masses are spheres, the payload
+is a box, the rover is a box and the post is a capsule. Parts on neighbouring
+bodies meet at their joint by design, so they aren't checked against each
+other, except two tubes folding onto each other (the region right at the
+joint is ignored). `COLLISION_MARGIN` in `arm_params.py` adds extra
+clearance (e.g. `0.01` = 1 cm). Untick **Check collisions** to turn it all off.
+
+### 4.4 Recording a move
 
 1. Move the arm to the start pose (sliders, preset or IK) and press
    **Set start = current pose**.
@@ -214,12 +238,12 @@ The result is saved in `recordings/<date>_<time>_<name>/`:
 
 | File | Content |
 |---|---|
-| `torques.csv` | One row per frame (60 per second). For each joint: commanded angle, actual angle, speed, **motor torque**, static torque, saturated (0/1); plus the TCP position. Opens in Excel. |
-| `summary.txt` | Each motor's peak torque, when it happens, the static peak, the limit, and whether it saturated. |
-| `motion.mp4` | 3D view, side view and a torque plot with a moving time cursor. Rendered in the background (10–30 s). Re-render with `python make_video.py recordings/<folder>`. |
+| `torques.csv` | One row per frame (60 per second). For each joint: commanded position, actual position, speed, **motor torque** (slide: force), static torque, saturated (0/1); the TCP position; and a `collision` column (empty = clear). Column names carry the units (`_deg`, `_m`, `_Nm`, `_N`). Opens in Excel. |
+| `summary.txt` | Each motor's peak torque, when it happens, the static peak, the limit, whether it saturated, and the time spans with collisions. |
+| `motion.mp4` | 3D view, side view and a torque plot with a moving time cursor. Colliding parts turn red, a red banner names them, and collision times are shaded on the plot. Rendered in the background (10–30 s). Re-render with `python make_video.py recordings/<folder>`. |
 | `motion.npz`, `video_log.txt` | Data used by the video; the video's log (look here if the MP4 is missing). |
 
-### 4.4 Design editing
+### 4.5 Design editing
 
 Open **Design**, choose an item and move it. A **yellow box** (±0.15 m,
 `DESIGN_BOX`) shows the space around the item's anchor and a **pink dot**
@@ -230,7 +254,7 @@ and regenerates `urc_arm.urdf`. Until you save, the status says "not saved".
 
 | Item | What it sets | Measured from |
 |---|---|---|
-| shoulder pivot | Shoulder axis location (its z sets the shoulder height: 0.55 + 0.0596 = 0.6096 m) | Turntable bearing centre |
+| shoulder pivot | Shoulder axis location (its z sets the shoulder height: 0.55 + 0.0596 = 0.6096 m) | Base centre (top of the carriage) |
 | link1: shoulder pivot | Where the shoulder axis passes through the upper-arm tube | Tube's near end |
 | link1: elbow pivot | Where the elbow axis is on the upper-arm tube | Tube's far end |
 | link2: elbow pivot | The same elbow axis, on the forearm tube | Tube's near end |
@@ -256,25 +280,28 @@ To change *which body* a motor is bolted to, or its anchor, edit `body` and
 `anchor` in `arm_params.py` (e.g. elbow motor on the forearm:
 `body="link2", anchor="tube_start"`).
 
-### 4.5 Editing `arm_params.py`
+### 4.6 Editing `arm_params.py`
 
 Open it in any text editor (`gedit arm_params.py` or VS Code). Sections:
 
 | Setting | Meaning |
 |---|---|
 | `L1`, `L2`, `L_GRIPPER` | Axis-to-axis lengths (m) |
-| `TURNTABLE_HEIGHT`, `ROVER` | Mount and rover body geometry |
+| `BASE_JOINT` | `"slide_y"` (prismatic, along Y; default) or `"yaw"` (turntable about Z) |
+| `BASE_HEIGHT`, `ROVER` | Top of the carriage / turntable, and the rover body geometry |
 | `DENSITY`, `SECTION_MM`, `WIRING_MASS` | Tube material and rectangular cross-section (width, height, wall in mm; wall 0 = solid) |
-| `SHOULDER_PIVOT`, `LINK_GEOMETRY` | Pivot offsets (4.4) |
-| `JOINTS` | Per joint: min, max (deg), effort limit (N·m), max speed (deg/s) |
+| `SHOULDER_PIVOT`, `LINK_GEOMETRY` | Pivot offsets (4.5). Default: link2 runs 4 cm to the left of link1 (side by side) |
+| `JOINTS` | Per joint: min, max (deg), effort limit (N·m), max speed (deg/s). `base_slide` uses metres, N and m/s; `base_yaw` is used only with the turntable |
 | `MOTORS`, `EXTRA_MASSES` | Body, anchor, position, mass (and size) of each part |
 | `COM_OVERRIDE` | Force a body's centre of mass, e.g. from CAD |
 | `PAYLOAD` | Box at the TCP; set `mass=5.0` for the URC box |
-| `HOME_DEG`, `PRESETS` | Home pose and preset buttons |
+| `HOME_DEG`, `PRESETS` | Home pose and preset buttons (`base` value in metres for the slide) |
 | `DRIVE_KE`, `DRIVE_KD` | Motor position-control stiffness and damping |
+| `COLLISION_MARGIN` | Extra clearance for the collision check (m) |
 
 Preset formats: `[x, y, z, pitch_deg]` (TCP target, solved by IK),
-`dict(joints_deg=[base, shoulder, elbow, wrist, gripper_yaw])`, `"home"` or
+`dict(joints_deg=[base, shoulder, elbow, wrist, gripper_yaw])` (base in
+metres for the slide), `"home"` or
 `"straight"`. `NOSE` (0.35 m) is the rover front and `DECK` (0.50 m) the deck
 height, so `[NOSE + 0.15, 0.0, 0.40, -90.0]` is 15 cm past the nose, 40 cm
 up, gripper pointing down.
@@ -295,15 +322,17 @@ quick summary without opening the window.
 * **Angles are relative**: each joint's angle is measured from the previous
   link, which is what the motor turns. The absolute angle of a link is the
   sum of the joints before it.
-* **Base yaw** turns the whole arm about +Z. **Gripper yaw** turns the
-  gripper about its own axis.
+* **Base slide** moves the whole arm along **+Y** (left), parallel to the
+  pitch axes, so the arm's plane of motion shifts sideways. (With
+  `BASE_JOINT = "yaw"`, the base turns the arm about +Z instead.)
+  **Gripper yaw** turns the gripper about its own axis.
 * **TCP** (tool centre point) = gripper tip. IK targets are TCP positions.
-* Torques in N·m; positive = the joint's positive direction.
+* Torques in N·m (slide: force in N); positive = the joint's positive direction.
 
 ### 5.2 Kinematic chain
 
 ```
-base_link ─fixed─ rover ─base_yaw (Z)─ turntable ─shoulder (−Y)─ link1
+base_link ─fixed─ rover ─base_slide (along Y)─ carriage ─shoulder (−Y)─ link1
    ─elbow (−Y)─ link2 ─wrist_pitch (−Y)─ wrist ─gripper_yaw (Z)─ gripper ─fixed─ tcp
 ```
 
@@ -311,7 +340,9 @@ Each moving body's frame has its origin **on its own joint axis**. For link1
 and link2, x points along the **pivot line** (this axis → next axis), so the
 next joint is at distance L1 / L2 along x. Joint angles are between pivot
 lines, so the kinematics are exactly those of an ideal arm with lengths
-L1 and L2, whatever the tube offsets are.
+L1 and L2, whatever the tube offsets are. The carriage's frame sits at
+(0, slide, `BASE_HEIGHT`); the mount post is part of it. With the yaw option
+the base link is called `turntable` and the joint `base_yaw` (about Z).
 
 ### 5.3 Tube geometry from pivot offsets
 
@@ -325,7 +356,7 @@ tube axes:
 The tube is then placed and rotated in the link frame so both pivots land
 exactly L apart. Geometry that can't work (|f_z − n_z| ≥ L, or T too short)
 is rejected with a message. Sideways (y) offsets shift the next link
-sideways; the IK's base yaw compensates for the total offset.
+sideways; the IK compensates for the total offset (4 cm by default).
 
 ### 5.4 Mass model
 
@@ -348,7 +379,8 @@ each joint, standing in for motor rotor inertia.
 * Newton's **MuJoCo solver** integrates the dynamics at 600 steps per
   second (10 substeps per 60 Hz frame). Contacts are off.
 * Each joint is a **position-controlled motor**:
-  τ = K_e(θ_cmd − θ) + K_d(θ̇_cmd − θ̇), limited to ±effort. The velocity
+  τ = K_e(θ_cmd − θ) + K_d(θ̇_cmd − θ̇), limited to ±effort (for the slide
+  the same law gives a force in N from position in m). The velocity
   feed-forward (θ̇_cmd) removes lag during moves. If the needed torque
   exceeds the effort limit, the motor saturates and the arm sags or falls
   behind, as a real undersized motor would.
@@ -367,7 +399,9 @@ each joint, standing in for motor rotor inertia.
 * **Static torque** = the torque to hold the current pose against gravity:
   the moment of the weight of every mass beyond a joint about that joint's
   axis, τₖ = −aₖ · Σ (rᵢ − pₖ) × mᵢg. Same method as the MATLAB sim. At
-  rest the motor torque equals it; the headless test checks this.
+  rest the motor torque equals it; the headless test checks this. On a level
+  rail the slide's static force is zero: it only needs force to accelerate
+  the arm (mass × acceleration), plus whatever friction the real rail has.
 * Jerk isn't a separate output: torque depends on position, speed and
   acceleration, and jerk is the slope of the torque curve.
 
@@ -375,16 +409,28 @@ each joint, standing in for motor rotor inertia.
 
 Given a TCP target (x, y, z) and gripper pitch φ:
 
-1. Base yaw points the arm plane at the target (allowing for any sideways
-   pivot offset).
+1. The slide moves the arm plane to the target's Y (slide = y − sideways
+   offset); if that's outside the slide's travel, the status says how far it
+   would need to go. (Turntable option: base yaw points the arm plane at the
+   target instead.)
 2. The wrist point is the TCP minus the gripper length along φ.
 3. Shoulder and elbow solve the two-link triangle analytically (law of
    cosines). There are two solutions (elbow up / down).
 4. The wrist angle is φ minus the shoulder and elbow angles.
 5. Angles are wrapped into the joint limits; solutions outside them are
-   dropped. Collisions are not checked.
+   dropped. With collision checking on, colliding solutions are dropped too.
 
-### 5.8 Saving design changes
+### 5.8 Collision checks
+
+For each pose the shapes in 4.3 are placed with forward kinematics and
+tested: capsule–capsule by closest distance between segments, sphere tests by
+point distance, capsule vs the rover box by a slab test on the box grown by
+the radius, payload box vs rover box by the separating-axis test, and
+anything vs the ground by its lowest point. A pair hits when the gap is
+below the sum of radii plus `COLLISION_MARGIN`. Only poses are checked, once
+per frame; a very fast move could pass through something between frames.
+
+### 5.9 Saving design changes
 
 `params_io.py` rewrites only the blocks between `# >>> AUTO:<NAME>` and
 `# <<< AUTO:<NAME>` in `arm_params.py` (pivots, motors, extra masses). It
@@ -425,6 +471,9 @@ git push
 | No `motion.mp4` in a recording | Check `video_log.txt`. Usually ffmpeg or matplotlib is missing (3.5). Re-render: `python make_video.py recordings/<folder>`. |
 | "There is no app installed for MPEG-4 video" | `sudo apt install vlc`, or drag the file into Chrome. |
 | Status says "out of reach" / "outside joint limits" | The IK target can't be reached with the current lengths/limits. Try another pitch or Elbow up/down. |
+| Status says "needs the slide at … m" | The target's Y is beyond the slide's travel. Move the target or widen `JOINTS["base_slide"]`. |
+| Status says "every solution collides: …" | Both elbow choices hit something. Change the target or pitch, or untick Check collisions to go there anyway. |
+| Readout shows red COLLISION | The current pose touches something; the message says what. |
 | Status says "rejected: …" after a design change | That geometry is impossible (e.g. pivot offsets bigger than the link); the change was undone. |
 | Arm droops and the readout shows SAT | That motor's effort limit is too low for the pose. Raise the limit in `JOINTS` or change the design. |
 | The arm dips after a design change | Normal: the model was rebuilt and is settling. |
@@ -434,17 +483,22 @@ git push
 
 ## 8. Limits and placeholders
 
-* **No collisions:** the rover and ground are drawn, but the arm passes
-  through them, and the IK doesn't check for collisions.
+* **Collisions are checked, not simulated:** the sim warns and the IK avoids
+  colliding poses, but the arm still passes through the rover and ground
+  physically (no contact forces). Checks use simplified shapes and run once
+  per frame.
 * **Rigid links and ideal motors:** no bending, backlash, belt stretch or
   motor electrical limits, so vibration from jerky moves isn't shown.
 * **Placeholders to replace when hardware is chosen** (marked `PLACEHOLDER`
   in `arm_params.py`): motor masses and sizes, effort limits, joint speeds,
-  turntable height, gripper actuator and camera masses.
-* Joint limits default to ±180° (gripper yaw ±90°).
+  base height, slide travel / force / speed, carriage mass, gripper actuator
+  and camera masses.
+* Joint limits default to ±180° (gripper yaw ±90°); the slide to ±0.35 m.
+* The slide is assumed level: rover tilt (driving on a slope) isn't modelled,
+  which would add a gravity load on the slide motor.
 * Payload is off by default (`PAYLOAD["mass"] = 0`).
 
-Ideas for later: collisions with the rover and ground, joint compliance
+Ideas for later: physical contacts (e.g. with a drawer), rover tilt, joint compliance
 (gearbox stiffness), jerk and torque-rate columns in the CSV, a 7th-order
 move profile with zero jerk at the ends, and a ROS 2 bridge for the real
 encoders.

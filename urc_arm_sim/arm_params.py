@@ -1,5 +1,5 @@
 """
-URC rover arm parameters (3-DOF pitch arm + base turntable).
+URC rover arm parameters (3-DOF pitch arm on a sliding base).
 
 Edit this file, then run:
     python build_urdf.py      # writes urc_arm.urdf and prints masses / torques
@@ -15,7 +15,10 @@ Conventions match the MATLAB sim (arm_simulation_README.md, section 2):
   * Pitch joints rotate about -Y: positive lifts the link toward +Z,
     0 = link pointing along +X. Angles are RELATIVE (what each motor turns)
     and are measured between PIVOT LINES (pivot-to-pivot), not tubes.
-  * base_yaw turntable rotates the whole arm about +Z (vertical).
+  * The base joint (BASE_JOINT) moves the whole arm:
+      "slide_y" - prismatic: slides along Y (left/right across the rover),
+                  parallel to the pitch axes. Default.
+      "yaw"     - turntable: rotates about +Z (vertical).
 
 Values marked PLACEHOLDER are guesses; replace them when hardware is chosen.
 """
@@ -27,8 +30,11 @@ L1 = 1.0             # shoulder axis -> elbow axis (m)  [team decision, Nov 2026
 L2 = 0.84            # elbow axis -> wrist axis (m)     [team decision, Nov 2026]
 L_GRIPPER = 0.15     # wrist axis -> TCP (m)
 
-TURNTABLE_HEIGHT = 0.55    # turntable bearing plane above ground (m). PLACEHOLDER
-# Shoulder height = TURNTABLE_HEIGHT + SHOULDER_PIVOT z  (0.6096 m in MATLAB).
+BASE_JOINT = "slide_y"     # "slide_y" (prismatic, along Y) or "yaw" (turntable about Z)
+BASE_HEIGHT = 0.55         # top of the carriage / turntable bearing above ground (m). PLACEHOLDER
+# Shoulder height = BASE_HEIGHT + SHOULDER_PIVOT z  (0.6096 m in MATLAB).
+# Slide: the base frame starts at (0, 0, BASE_HEIGHT) and moves along +Y; the rail
+# is drawn on the deck and the mount post rides on the carriage.
 
 # ---------------------------------------------------------------- rover body (drawn; contacts off)
 ROVER = dict(
@@ -62,20 +68,26 @@ WIRING_MASS = 0.1      # kg, spread by length over link1, link2, gripper [MATLAB
 # The tube length and its tilt relative to the pivot line are worked out so
 # the pivot-to-pivot distance stays L1 / L2. y offsets shift the next link
 # sideways (they don't change the planar kinematics).
-# SHOULDER_PIVOT is the shoulder axis relative to the turntable bearing centre.
+# SHOULDER_PIVOT is the shoulder axis relative to the base centre (carriage / turntable).
+# Default layout: link2 runs BESIDE link1, 4 cm to the left (centre to centre:
+# 25.4 mm tubes + ~15 mm gap), so the elbow can fold past link1. The gripper is
+# in line with link2. The IK allows for the 4 cm sideways offset.
 # >>> AUTO:PIVOTS
 SHOULDER_PIVOT = (0.0, 0.0, 0.0596)
 LINK_GEOMETRY = {
     "link1": dict(near=(0.0, 0.0, 0.0), far=(0.0, 0.0, 0.0)),
-    "link2": dict(near=(0.0, 0.0, 0.0), far=(0.0, 0.0, 0.0)),
+    "link2": dict(near=(0.0, -0.04, 0.0), far=(0.0, 0.0, 0.0)),
 }
 # <<< AUTO:PIVOTS
 
 # ---------------------------------------------------------------- joints
-# Relative limits in degrees, max effort (N*m) and max speed (deg/s).
+# Pitch/yaw joints: limits in degrees, max effort (N*m), max speed (deg/s).
+# base_slide (used when BASE_JOINT = "slide_y"): limits in METRES, effort in N,
+# speed in m/s. base_yaw is used when BASE_JOINT = "yaw".
 # Effort is enforced in the sim: a motor that is too weak will sag.
 JOINTS = {
     #               min    max   effort  speed
+    "base_slide":  (-0.35, 0.35, 200.0,  0.15),  # PLACEHOLDER (m, m, N, m/s)
     "base_yaw":    (-180,  180,   40.0,   60),   # PLACEHOLDER
     "shoulder":    (-180,  180,  120.0,   45),   # PLACEHOLDER
     "elbow":       (-180,  180,   80.0,   45),   # PLACEHOLDER
@@ -86,7 +98,8 @@ JOINTS = {
 # ---------------------------------------------------------------- motors and other masses
 # Each item is rigidly mounted on a body:
 #   body   : "rover"     - fixed to the rover (adds no arm load)
-#            "turntable" - rotates with base yaw; origin at the bearing centre
+#            "base"      - the carriage (or turntable); moves with the base joint;
+#                          origin at its centre, BASE_HEIGHT above ground
 #            "link1"     - upper arm;  origin at the shoulder axis
 #            "link2"     - forearm;    origin at the elbow axis
 #            "wrist"     - between wrist pitch and gripper yaw; origin at the wrist axis
@@ -101,10 +114,10 @@ JOINTS = {
 # (stator on the upper arm) or on link2, at the joint or remote (belt drive).
 # >>> AUTO:MOTORS
 MOTORS = {
-    "base_yaw": dict(drives="base_yaw", body="rover", anchor="pivot", xyz=(0.0, 0.0, 0.49), mass=1.0, radius=0.045, length=0.1),  # PLACEHOLDER
-    "shoulder": dict(drives="shoulder", body="turntable", anchor="pivot", xyz=(0.0, -0.06, 0.0596), mass=1.2, radius=0.045, length=0.09),  # PLACEHOLDER
+    "base": dict(drives="base", body="rover", anchor="pivot", xyz=(0.0, -0.45, 0.53), mass=1.0, radius=0.045, length=0.1),  # PLACEHOLDER
+    "shoulder": dict(drives="shoulder", body="base", anchor="pivot", xyz=(0.0, -0.06, 0.0596), mass=1.2, radius=0.045, length=0.09),  # PLACEHOLDER
     "elbow": dict(drives="elbow", body="link1", anchor="tube_end", xyz=(0.0, -0.05, 0.0), mass=0.8, radius=0.04, length=0.07),  # PLACEHOLDER
-    "wrist_pitch": dict(drives="wrist_pitch", body="link2", anchor="tube_end", xyz=(0.0, -0.04, 0.0), mass=0.4, radius=0.03, length=0.06),  # PLACEHOLDER
+    "wrist_pitch": dict(drives="wrist_pitch", body="link2", anchor="tube_end", xyz=(0.0, 0.04, 0.0), mass=0.4, radius=0.03, length=0.06),  # PLACEHOLDER
     "gripper_yaw": dict(drives="gripper_yaw", body="wrist", anchor="pivot", xyz=(0.0, 0.0, 0.0), mass=0.3, radius=0.025, length=0.05),  # PLACEHOLDER
 }
 # <<< AUTO:MOTORS
@@ -113,7 +126,7 @@ MOTORS = {
 # Same body / anchor / xyz rules; drawn as boxes of the given size (m).
 # >>> AUTO:EXTRAS
 EXTRA_MASSES = {
-    "turntable_plate": dict(body="turntable", anchor="pivot", xyz=(0.0, 0.0, 0.01), mass=0.5, size=(0.15, 0.15, 0.02)),  # PLACEHOLDER
+    "carriage": dict(body="base", anchor="pivot", xyz=(0.0, 0.0, -0.02), mass=1.0, size=(0.15, 0.15, 0.04)),  # PLACEHOLDER
     "gripper_actuator": dict(body="gripper", anchor="pivot", xyz=(0.05, 0.0, 0.03), mass=0.3, size=(0.06, 0.04, 0.04)),  # PLACEHOLDER
     "camera": dict(body="gripper", anchor="pivot", xyz=(0.03, 0.0, 0.05), mass=0.1, size=(0.03, 0.06, 0.03)),  # PLACEHOLDER
 }
@@ -131,11 +144,13 @@ COM_OVERRIDE = {
 PAYLOAD = dict(mass=0.0, size=(0.40, 0.40, 0.40), inset=0.0)   # set mass=5.0 for the URC box
 
 # ---------------------------------------------------------------- sim
-HOME_DEG = dict(base_yaw=0, shoulder=80, elbow=-150, wrist_pitch=-20, gripper_yaw=0)   # folded, gripper down
+# Home pose. "base" is metres for the slide, degrees for yaw; the rest are degrees.
+HOME_DEG = dict(base=0, shoulder=80, elbow=-150, wrist_pitch=-20, gripper_yaw=0)   # folded, gripper down
 
 # Preset buttons in the sim. Each entry is one of:
 #   [x, y, z, pitch_deg]   TCP target in world metres (solved with the IK, "Elbow up" setting)
-#   dict(joints_deg=[base_yaw, shoulder, elbow, wrist_pitch, gripper_yaw])   joint angles
+#   dict(joints_deg=[base, shoulder, elbow, wrist_pitch, gripper_yaw])   joint values
+#        (base in metres for the slide, degrees for yaw)
 #   "home" (= HOME_DEG)  or  "straight" (all joints 0)
 # NOSE is the rover front (x); DECK is the deck height (z).
 NOSE = ROVER["mount_behind_front"]
@@ -146,8 +161,9 @@ PRESETS = {
     "Drawer": [NOSE + 0.15, 0.0, 1.90, -90.0],
     "Straight out": "straight",
 }
-DRIVE_KE = 5000.0    # position-drive stiffness (N*m/rad)
-DRIVE_KD = 150.0     # position-drive damping (N*m*s/rad)
+DRIVE_KE = 5000.0    # position-drive stiffness (N*m/rad; N/m for the slide)
+DRIVE_KD = 150.0     # position-drive damping (N*m*s/rad; N*s/m for the slide)
 DESIGN_BOX = 0.15    # half-size (m) of the box the design sliders move within
+COLLISION_MARGIN = 0.0   # extra clearance (m) required by the collision check (e.g. 0.01)
 URDF_FILE = "urc_arm.urdf"
 RECORD_DIR = "recordings"

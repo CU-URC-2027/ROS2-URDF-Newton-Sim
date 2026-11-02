@@ -51,6 +51,13 @@ def part_visuals(p):
     return geom_xml("visual", p["name"], p["com"], box(p["size"]), k, p.get("rpy", (0, 0, 0)))
 
 
+def link_name(P, body):
+    """URDF link name of a body (the base is a carriage or a turntable)."""
+    if body == "base":
+        return "carriage" if am.base_slides(P) else "turntable"
+    return body
+
+
 def build(P):
     """Return the URDF as a string."""
     parts = am.body_parts(P)
@@ -67,7 +74,8 @@ def build(P):
     nose = R["mount_behind_front"]
     rover_c = (nose - R["length"] / 2, 0, (R["ground_clearance"] + R["deck_height"]) / 2)
     rover_s = (R["length"], R["width"], R["deck_height"] - R["ground_clearance"])
-    post_len = max(P.TURNTABLE_HEIGHT - R["deck_height"], 0.01)
+    post_len = max(P.BASE_HEIGHT - R["deck_height"], 0.01)
+    slide = am.base_slides(P)
     # massless root (ROS convention; KDL ignores inertia on the root link)
     out.append('  <link name="base_link"/>\n')
     out.append('  <joint name="base_to_rover" type="fixed">\n    <parent link="base_link"/>\n'
@@ -76,8 +84,13 @@ def build(P):
     out.append(inertial_xml(50.0, rover_c, np.diag([5, 5, 5])))
     out.append(geom_xml("visual", "rover_body", rover_c, box(rover_s), "rover"))
     out.append(geom_xml("collision", "rover_body", rover_c, box(rover_s), "rover"))
-    out.append(geom_xml("visual", "mount_post", (0, 0, R["deck_height"] + post_len / 2),
-                        f'<cylinder radius="0.04" length="{post_len:.6g}"/>', "post"))
+    if slide:   # rail on the deck; the post rides on the carriage (drawn on the base link)
+        lo_s, hi_s, _, _ = am.joint_limits(P, "base")
+        out.append(geom_xml("visual", "rail", (0, (lo_s + hi_s) / 2, R["deck_height"] + 0.01),
+                            box((0.06, hi_s - lo_s + 0.2, 0.02)), "post"))
+    else:
+        out.append(geom_xml("visual", "mount_post", (0, 0, R["deck_height"] + post_len / 2),
+                            f'<cylinder radius="0.04" length="{post_len:.6g}"/>', "post"))
     for p in parts["rover"]:
         out.append(part_visuals(p))
     out.append('  </link>\n')
@@ -85,14 +98,19 @@ def build(P):
     # ---- moving bodies
     parent = "rover"
     for j, body in zip(am.JOINT_ORDER, am.BODY_ORDER):
-        lo, hi, eff, vel = P.JOINTS[j]
-        out.append(f'  <joint name="{j}" type="revolute">\n    <parent link="{parent}"/>\n'
-                   f'    <child link="{body}"/>\n    <origin xyz="{f(org[j])}" rpy="0 0 0"/>\n'
-                   f'    <axis xyz="{f(am.JOINT_AXIS[j])}"/>\n'
-                   f'    <limit lower="{math.radians(lo):.6g}" upper="{math.radians(hi):.6g}" '
-                   f'effort="{eff:.6g}" velocity="{math.radians(vel):.6g}"/>\n  </joint>\n')
+        lo, hi, eff, vel = am.joint_limits(P, j)
+        jtype = "prismatic" if am.is_prismatic(P, j) else "revolute"
+        link = link_name(P, body)
+        out.append(f'  <joint name="{am.joint_name(P, j)}" type="{jtype}">\n    <parent link="{parent}"/>\n'
+                   f'    <child link="{link}"/>\n    <origin xyz="{f(org[j])}" rpy="0 0 0"/>\n'
+                   f'    <axis xyz="{f(am.joint_axis(P, j))}"/>\n'
+                   f'    <limit lower="{lo:.6g}" upper="{hi:.6g}" effort="{eff:.6g}" velocity="{vel:.6g}"/>\n'
+                   f'  </joint>\n')
         bi = inert[body]
-        out.append(f'  <link name="{body}">\n')
+        out.append(f'  <link name="{link}">\n')
+        if body == "base" and slide:
+            out.append(geom_xml("visual", "mount_post", (0, 0, -post_len / 2),
+                                f'<cylinder radius="0.04" length="{post_len:.6g}"/>', "post"))
         out.append(inertial_xml(bi["mass"], bi["com"], bi["inertia"]))
         if j in ("shoulder", "elbow", "wrist_pitch"):   # red marker on the pitch axis
             out.append(geom_xml("visual", f"{j}_axis", (0, 0, 0),
@@ -103,7 +121,7 @@ def build(P):
                 out.append(geom_xml("collision", p["name"], p["com"], box(p["size"]), p["kind"],
                                     p.get("rpy", (0, 0, 0))))
         out.append('  </link>\n')
-        parent = body
+        parent = link
 
     # ---- TCP marker
     out.append(f'  <joint name="tcp_joint" type="fixed">\n    <parent link="gripper"/>\n    <child link="tcp"/>\n'
@@ -117,7 +135,11 @@ def build(P):
 
 def summary(P):
     inert = am.body_inertials(P)
-    print(f"\nShoulder axis height {am.shoulder_height(P):.4f} m, arm plane offset {am.lateral_offset(P):+.4f} m (Y)")
+    kind = "slide along Y" if am.base_slides(P) else "yaw turntable"
+    lo, hi, _, _ = am.joint_limits(P, "base")
+    rng = f"{lo:+.3f} to {hi:+.3f} m" if am.base_slides(P) else f"{math.degrees(lo):+.0f} to {math.degrees(hi):+.0f} deg"
+    print(f"\nBase: {kind} ({rng}). Shoulder axis height {am.shoulder_height(P):.4f} m, "
+          f"arm plane offset {am.lateral_offset(P):+.4f} m (Y)")
     for link in am.TUBE_LINKS:
         g = am.link_geometry(P, link)
         print(f"  {link}: pivot-to-pivot {am.link_length(P, link):.3f} m, tube {g['T']:.3f} m, "
@@ -136,12 +158,14 @@ def summary(P):
         "straight out, level": [0, 0, 0, 0, 0],
         "straight out, gripper down": [0, 0, 0, -math.pi / 2, 0],
     }
-    print("\nStatic holding torques (N*m)        " + "  ".join(f"{j:>11s}" for j in am.JOINT_ORDER))
+    names = [am.joint_name(P, j) for j in am.JOINT_ORDER]
+    eff = [am.joint_limits(P, j)[2] for j in am.JOINT_ORDER]
+    print("\nStatic holding torques (N*m; N for a slide) " + "  ".join(f"{n:>11s}" for n in names))
     for name, q in poses.items():
         tau = am.static_torques(P, q, inert)
-        flags = ["*" if abs(t) > P.JOINTS[j][2] else " " for t, j in zip(tau, am.JOINT_ORDER)]
-        print(f"  {name:32s}  " + "  ".join(f"{t:10.2f}{fl}" for t, fl in zip(tau, flags)))
-    print("  effort limit                      " + "  ".join(f"{P.JOINTS[j][2]:10.2f} " for j in am.JOINT_ORDER))
+        flags = ["*" if abs(t) > e else " " for t, e in zip(tau, eff)]
+        print(f"  {name:40s}  " + "  ".join(f"{t:10.2f}{fl}" for t, fl in zip(tau, flags)))
+    print(f"  {'effort limit':40s}  " + "  ".join(f"{e:10.2f} " for e in eff))
     print("  (* = above the joint's effort limit; the sim arm will sag there)")
 
 
