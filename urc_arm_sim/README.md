@@ -8,7 +8,7 @@ arm.
 
 The arm: a **sliding base** that moves the whole arm left/right across the
 rover (a prismatic joint along Y, ±0.35 m), **shoulder**, **elbow** and
-**wrist** (pitch), and a **gripper yaw**. Link 1 = 1.0 m and link 2 = 0.84 m
+**wrist** (pitch), and a **wrist roll** (about the gripper's own axis). Link 1 = 1.0 m and link 2 = 0.84 m
 axis to axis, gripper 0.15 m. A turntable (yaw) base is available instead
 with one setting (`BASE_JOINT`, 4.6). It is the successor to the team's MATLAB arm sim and
 uses the same coordinate conventions.
@@ -40,7 +40,9 @@ presets) lives in **one file, `arm_params.py`**.
 | `arm_model.py` | The arm's math: geometry, mass properties, forward/inverse kinematics, static torques, collision checks. |
 | `build_urdf.py` | Writes `urc_arm.urdf` from the params and prints masses, tube lengths and holding torques. |
 | `make_video.py` | Turns a recording into an MP4 (the sim runs it automatically). |
-| `params_io.py` | Writes design changes made in the sim back into `arm_params.py`. |
+| `scene.py` | Task objects: the box with its handle, the drawer cabinet and sliding tray. |
+| `mission.py` | The box → drawer mission: plan, check, rover-pose search, reach map. |
+| `params_io.py` | Writes design and task changes made in the sim back into `arm_params.py`. |
 | `urc_arm.urdf` | Generated robot description (for other tools, e.g. ROS). Regenerate with `python build_urdf.py`; don't edit by hand. |
 | `requirements.txt` | Python packages to install. |
 
@@ -204,8 +206,10 @@ box, type a value and press **Enter**.
 | **Presets** | Buttons for saved poses. Edit `PRESETS` in `arm_params.py`. |
 | **TCP target / IK** | Type a gripper-tip position (m) and pitch (deg; −90 = pointing down, 0 = level) and press **Solve IK**. The slide moves the arm sideways to line up with the target's Y (a turntable base turns to face it instead). **Elbow up** picks between the two arm solutions; if one collides, the other is used. |
 | **Record move** | Records a move from a start pose to an end pose (4.4). |
+| **Platform and stability** | Chassis size, deck height, mass and COM; arm mount position; wheels; slope (4.8). |
+| **Task: box → drawer** | Place the box, set grasps and rover poses, check or run the mission, make a reach map (4.7). |
 | **Design** | Move pivots, motors and masses live and save them (4.5). |
-| **Readout** | TCP position; **collision status** (green "clear" or red "COLLISION: …"); and for every motor: position, torque now (slide: force in N), static (holding) torque, and effort limit. **SAT** = the motor is at its limit and can't hold or follow the command. |
+| **Readout** | TCP position; **tip margin** (now, and if braking/turning), **wheel loads**, **arm mount loads**; **collision status** (green "clear" or red "COLLISION: …"); and for every motor: position, torque now (slide: force in N), static (holding) torque, and effort limit. **SAT** = the motor is at its limit and can't hold or follow the command. |
 
 ### 4.3 Collision checking
 
@@ -288,7 +292,9 @@ Open it in any text editor (`gedit arm_params.py` or VS Code). Sections:
 |---|---|
 | `L1`, `L2`, `L_GRIPPER` | Axis-to-axis lengths (m) |
 | `BASE_JOINT` | `"slide_y"` (prismatic, along Y; default) or `"yaw"` (turntable about Z) |
-| `BASE_HEIGHT`, `ROVER` | Top of the carriage / turntable, and the rover body geometry |
+| `CHASSIS`, `ARM_MOUNT`, `WHEELS`, `SLOPE` | The platform (4.8): chassis box, mass and COM; where the arm is mounted on the deck; wheel layout; ground slope |
+| `BASE_ABOVE_DECK` | Top of the carriage / turntable above the deck (base height = deck + this) |
+| `DRIVE_ACCEL` | Braking / accelerating / turning acceleration for the worst-case tipping check |
 | `DENSITY`, `SECTION_MM`, `WIRING_MASS` | Tube material and rectangular cross-section (width, height, wall in mm; wall 0 = solid) |
 | `SHOULDER_PIVOT`, `LINK_GEOMETRY` | Pivot offsets (4.5). Default: link2 runs 4 cm to the left of link1 (side by side) |
 | `JOINTS` | Per joint: min, max (deg), effort limit (N·m), max speed (deg/s). `base_slide` uses metres, N and m/s; `base_yaw` is used only with the turntable |
@@ -300,7 +306,7 @@ Open it in any text editor (`gedit arm_params.py` or VS Code). Sections:
 | `COLLISION_MARGIN` | Extra clearance for the collision check (m) |
 
 Preset formats: `[x, y, z, pitch_deg]` (TCP target, solved by IK),
-`dict(joints_deg=[base, shoulder, elbow, wrist, gripper_yaw])` (base in
+`dict(joints_deg=[base, shoulder, elbow, wrist, wrist_roll])` (base in
 metres for the slide), `"home"` or
 `"straight"`. `NOSE` (0.35 m) is the rover front and `DECK` (0.50 m) the deck
 height, so `[NOSE + 0.15, 0.0, 0.40, -90.0]` is 15 cm past the nose, 40 cm
@@ -308,6 +314,104 @@ up, gripper pointing down.
 
 Restart the sim after editing the file. `python build_urdf.py` prints a
 quick summary without opening the window.
+
+### 4.7 Task: box → drawer
+
+The task scene has the **box** (40 cm envelope including the handle, 5 kg,
+handle bar on top), a **drawer cabinet** with a tray that pulls out, a blue
+**box zone** on the ground, and the **rover**, which can now drive. The
+mission:
+
+1. **Open the drawer:** approach the drawer handle, grip, pull the tray out
+   just far enough for the box ("exact fit"), release, back off.
+2. **Pick up the box:** stow, drive if needed, approach above the handle,
+   lower, grip (the box's mass is added to the gripper from here on), lift.
+3. **Put it in the drawer:** raise the box above the tray rim, drive if
+   needed, move over the tray, lower, release, back off, move clear of the
+   drawer, stow.
+
+Straight-line moves (reaching handles, pulling, lifting, lowering) keep the
+gripper pitch fixed and move the TCP in a straight line. Other moves are
+smooth joint moves. The rover drives between phases with the arm holding
+still.
+
+**Panel controls:**
+
+| Control | What it does |
+|---|---|
+| Show task scene | Shows the objects and includes them in the collision checks. |
+| box x / y / yaw | Where the box sits (inside the zone; yaw turns the box and its handle). **Random spot in zone** picks one. |
+| auto wrist roll | On (default): the mission picks the wrist roll that closes the jaws squarely on each handle, and re-rolls while placing so the (square) box goes into the tray square. Off: uses the roll values below. |
+| box / drawer pitch (roll) | The gripper pitch for each grasp (deg; −90 = pointing down, 0 = level), and the wrist roll when auto roll is off. |
+| Rover pose per phase | Where the rover stands for each phase (x, y m; yaw deg). **drive here** drives it there now. |
+| **Check mission** | Plans the mission and steps through it without physics (a few seconds). Lists every step with a collision, a motor over its limit, or a grasp problem. |
+| **Find rover poses** | For each phase, searches for the nearest rover pose (forward/back first, then sideways, then turning) where that phase is clear and within the motor limits, and fills in the poses. |
+| **Reach map** | For every box position in the zone (5 cm grid), checks whether the arm can pick the box up from the pick-up rover pose. Draws coloured dots on the ground and saves `reach_map.png` + `.csv` in `recordings/`. |
+| **Run mission** | Runs the whole mission with physics; with **record** ticked it saves a recording (4.4) with extra columns: `rover_x/y/yaw`, `drawer_open_m`, `box_held`, `step`, and a per-step torque table in `summary.txt`. The video shows the box, drawer and rover. |
+| Reset scene | Box back on the ground, drawer closed, rover and arm home. |
+| Save task settings | Writes box pose, grasps and rover poses into `arm_params.py`. |
+
+**Grasp checks.** At each grip the check reports if the jaws are more than
+`jaw_tol_deg` (10°) from closing squarely on the handle, or if the handle is
+wider than the jaw opening (`GRIPPER["max_opening"]`). The jaws close along
+the gripper's `GRIPPER["jaw_axis"]` (default `y`, parallel to the pitch axes).
+These are warnings; the mission still runs. With auto wrist roll on, the
+jaws are always squared to the handle, so this only matters with the roll
+set by hand.
+
+**Settings in `arm_params.py`** (task section): `TASK_BOX` (size, mass,
+handle), `BOX_ZONE`, `DRAWER` (position, floor height, pull direction,
+clearances, handle), `MISSION` (approach and retract distances, lift and rim
+clearances, speeds, jaw tolerance, reach-map step), `GRIPPER` (jaw axis and
+opening), `ROVER_KE/KD`, and the saved `BOX_POSE`, `BOX_GRASP`,
+`DRAWER_GRASP`, `ROVER_POSES`.
+
+**What it doesn't model (yet):** the box is attached to the gripper when
+gripped (no jaw contact, friction or slip); the drawer follows the gripper
+along its slide with no friction or pull force on the arm; the rover drives
+on flat ground.
+
+### 4.8 Platform and stability (tipping, wheel loads, mount loads)
+
+The **platform** is the chassis top (deck). In the panel (or `arm_params.py`)
+you set:
+
+| Setting | Meaning |
+|---|---|
+| chassis length / width, deck height, ground clearance | The chassis box. Raising the deck raises the arm with it. |
+| chassis mass, COM x / y / height | The rover without the arm; COM x, y from the chassis centre. |
+| arm mount x / y | Where the arm sits on the deck, from the chassis centre. |
+| wheelbase, track, wheel diameter | Wheel contact points at (±wheelbase/2, ±track/2) from the chassis centre. |
+| rocker pivot x | Where the side rockers pivot, from the chassis centre. |
+| slope, downhill direction | Ground slope (deg) and which way is downhill (deg from +X). |
+| braking/turning check | `DRIVE_ACCEL`, the extra acceleration for the worst-case check. |
+
+Changes rebuild the model when you release a slider. **Save platform to
+arm_params.py** keeps them. The world origin stays on the ground under the
+arm mount, so moving the mount moves the chassis and wheels around it.
+
+**What you see:**
+
+* In the 3D view, the **wheel footprint** on the ground and the **centre of
+  pressure** (dot): green when the margin is over 5 cm, orange under 5 cm,
+  red when tipping.
+* In the readout:
+  * **Tip margin:** distance from the centre of pressure to the nearest
+    footprint edge (front, rear, left, right). Negative = tipping over that
+    edge. The second number is the worst case if the rover also brakes,
+    accelerates or turns at `DRIVE_ACCEL` in any direction.
+  * **Wheel loads** (N) for FL, FR, RL, RR. **LIFT** = a wheel is lifting off.
+  * **Arm mount loads:** vertical force, horizontal shear, bending moment
+    and twist at the mount (deck height), for sizing the mount plate,
+    bolts and bearing.
+* **Recordings** add `tip_margin_m`, `tip_edge`, `tip_margin_driving_m`, the
+  four wheel loads and the four mount loads to `torques.csv`, a tipping
+  section to `summary.txt` (least margin and when, lightest wheel, peak
+  mount bending), and the footprint and centre of pressure to the video.
+* **Check mission** reports the least tip margin over the mission (and
+  while driving), and flags any step where the rover tips or a wheel lifts.
+  **Find rover poses** rejects poses where the rover would tip.
+* `python build_urdf.py` prints the margins for the test poses.
 
 ---
 
@@ -325,7 +429,9 @@ quick summary without opening the window.
 * **Base slide** moves the whole arm along **+Y** (left), parallel to the
   pitch axes, so the arm's plane of motion shifts sideways. (With
   `BASE_JOINT = "yaw"`, the base turns the arm about +Z instead.)
-  **Gripper yaw** turns the gripper about its own axis.
+* **The wrist has two joints:** **wrist pitch**, which moves the gripper in
+  the arm's plane like the shoulder and elbow, then **wrist roll**, which
+  turns the gripper about its own axis (the TCP doesn't move).
 * **TCP** (tool centre point) = gripper tip. IK targets are TCP positions.
 * Torques in N·m (slide: force in N); positive = the joint's positive direction.
 
@@ -333,7 +439,7 @@ quick summary without opening the window.
 
 ```
 base_link ─fixed─ rover ─base_slide (along Y)─ carriage ─shoulder (−Y)─ link1
-   ─elbow (−Y)─ link2 ─wrist_pitch (−Y)─ wrist ─gripper_yaw (Z)─ gripper ─fixed─ tcp
+   ─elbow (−Y)─ link2 ─wrist_pitch (−Y)─ wrist ─wrist_roll (X, along the gripper)─ gripper ─fixed─ tcp
 ```
 
 Each moving body's frame has its origin **on its own joint axis**. For link1
@@ -379,8 +485,15 @@ each joint, standing in for motor rotor inertia.
 * Newton's **MuJoCo solver** integrates the dynamics at 600 steps per
   second (10 substeps per 60 Hz frame). Contacts are off.
 * Each joint is a **position-controlled motor**:
-  τ = K_e(θ_cmd − θ) + K_d(θ̇_cmd − θ̇), limited to ±effort (for the slide
-  the same law gives a force in N from position in m). The velocity
+  τ = K_e(θ_cmd − θ) + K_d(θ̇_cmd − θ̇) + τ_g, limited to ±effort (for the
+  slide the same law gives a force in N from position in m). τ_g is
+  **gravity feed-forward** (`GRAVITY_FF`): the static torque the commanded
+  pose needs, as a real controller with gravity compensation would add.
+  Without it a position controller sags under load (about 1° at the
+  shoulder for 100 N·m), which is enough to push a held box into the drawer.
+* The **rover** is driven by three position-controlled joints (x, y, yaw)
+  between the ground and the rover body (`ROVER_KE/KD`), so its
+  accelerations reach the arm. The velocity
   feed-forward (θ̇_cmd) removes lag during moves. If the needed torque
   exceeds the effort limit, the motor saturates and the arm sags or falls
   behind, as a real undersized motor would.
@@ -417,6 +530,10 @@ Given a TCP target (x, y, z) and gripper pitch φ:
 3. Shoulder and elbow solve the two-link triangle analytically (law of
    cosines). There are two solutions (elbow up / down).
 4. The wrist angle is φ minus the shoulder and elbow angles.
+   The wrist roll doesn't move the TCP, so it is simply set to the
+   requested value (in the mission: the auto roll that squares the jaws to
+   the handle, θ = atan2(−a·b, c·b) with a and c the jaw directions at roll
+   0 and 90° and b the handle bar).
 5. Angles are wrapped into the joint limits; solutions outside them are
    dropped. With collision checking on, colliding solutions are dropped too.
 
@@ -430,7 +547,41 @@ anything vs the ground by its lowest point. A pair hits when the gap is
 below the sum of radii plus `COLLISION_MARGIN`. Only poses are checked, once
 per frame; a very fast move could pass through something between frames.
 
-### 5.9 Saving design changes
+### 5.9 Tipping and wheel loads
+
+Everything on the rover is a point mass: the chassis (at its COM), the
+rover-mounted parts, and each arm body (with a held box added to the
+gripper). In the sim, each mass's acceleration comes from its position over
+the last three frames (lightly smoothed), so arm swings and rover driving
+both count. The ground must supply
+
+$$\mathbf F=\sum m_i(\mathbf a_i-\mathbf g),\qquad \mathbf M_O=\sum \mathbf r_i\times m_i(\mathbf a_i-\mathbf g)$$
+
+(rotational inertia of each body is neglected). The **centre of pressure**
+is where this load meets the ground: $x_c=-M_y/F_z$, $y_c=M_x/F_z$ in the
+rover frame. The **tip margin** is its distance to the nearest edge of the
+wheel rectangle.
+
+**Wheel loads (rocker-differential).** Four unknown normal forces $N_i$, four
+equations: vertical force, the two tipping moments, and the differential
+condition. The differential makes the two rockers turn equal and opposite,
+so (by virtual work) they carry equal moments about their pivots:
+
+$$N_{FL}(x_F-x_p)+N_{RL}(x_R-x_p)=N_{FR}(x_F-x_p)+N_{RR}(x_R-x_p)$$
+
+A negative $N_i$ means that wheel lifts off. Friction forces lie in the
+ground plane and don't enter these equations.
+
+**Mount loads:** the same sums over the arm bodies only, about the mount
+point on the deck, expressed in the rover's axes.
+
+**Slope:** gravity is tilted in the physics and in every calculation
+(static torques, gravity feed-forward, stability); the drawn ground stays
+level. **Driving check:** the stability is recomputed with an extra uniform
+acceleration of `DRIVE_ACCEL` forward, backward, left and right, and the
+worst case is reported.
+
+### 5.10 Saving design changes
 
 `params_io.py` rewrites only the blocks between `# >>> AUTO:<NAME>` and
 `# <<< AUTO:<NAME>` in `arm_params.py` (pivots, motors, extra masses). It
@@ -483,6 +634,13 @@ git push
 
 ## 8. Limits and placeholders
 
+* **Tipping is calculated, not simulated:** the rover never actually tips
+  in the sim (its pose is held by the drive joints); the margin and wheel
+  loads say when it would. Each body's rotational inertia is left out of the
+  tipping calculation; wheels are points on flat ground; the chassis and
+  rockers are rigid.
+* **Task simplifications** (4.7): grasping attaches the box (no contact or
+  slip), the drawer follows the gripper without resistance, flat ground.
 * **Collisions are checked, not simulated:** the sim warns and the IK avoids
   colliding poses, but the arm still passes through the rover and ground
   physically (no contact forces). Checks use simplified shapes and run once
@@ -492,8 +650,9 @@ git push
 * **Placeholders to replace when hardware is chosen** (marked `PLACEHOLDER`
   in `arm_params.py`): motor masses and sizes, effort limits, joint speeds,
   base height, slide travel / force / speed, carriage mass, gripper actuator
-  and camera masses.
-* Joint limits default to ±180° (gripper yaw ±90°); the slide to ±0.35 m.
+  and camera masses, chassis mass and COM, wheelbase, track, wheel size,
+  rocker pivot, `DRIVE_ACCEL`.
+* Joint limits default to ±180°; the slide to ±0.35 m.
 * The slide is assumed level: rover tilt (driving on a slope) isn't modelled,
   which would add a gravity load on the slide motor.
 * Payload is off by default (`PAYLOAD["mass"] = 0`).

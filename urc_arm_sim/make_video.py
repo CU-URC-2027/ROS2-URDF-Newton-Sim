@@ -20,12 +20,41 @@ COLORS = ["#7f7f7f", "#1f77b4", "#d62728", "#2ca02c", "#9467bd"]   # one per joi
 MASS_COLORS = {"motor": "#ff8c1a", "extra": "#8c8c99", "payload": "#c8a165"}
 
 
-def rover_box_edges(rover):
-    nose, length, width, clear, deck = rover
-    xs, ys, zs = (nose - length, nose), (-width / 2, width / 2), (clear, deck)
+EDGES = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)]
+
+
+def rover_corners(rover, pose=(0.0, 0.0, 0.0)):
+    """Rover body corners in the world for a rover pose (x, y, yaw_rad).
+    rover = (centre x, centre y, length, width, clearance, deck) in the rover frame
+    (older recordings: (nose, length, width, clearance, deck))."""
+    if len(rover) == 5:
+        nose, length, width, clear, deck = rover
+        cx, cy = nose - length / 2, 0.0
+    else:
+        cx, cy, length, width, clear, deck = rover
+    xs, ys, zs = (cx - length / 2, cx + length / 2), (cy - width / 2, cy + width / 2), (clear, deck)
     c = np.array([[x, y, z] for x in xs for y in ys for z in zs])
-    edges = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)]
-    return [(c[a], c[b]) for a, b in edges]
+    cy, sy = np.cos(pose[2]), np.sin(pose[2])
+    R = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return c @ R.T + np.array([pose[0], pose[1], 0.0])
+
+
+def obb_corners(c, R, h):
+    s = np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)], float)
+    return c + (s * h) @ R.T
+
+
+def edge_path(corners):
+    """One polyline (NaN-separated) through the 12 edges of a box."""
+    out = []
+    for a, b in EDGES:
+        out += [corners[a], corners[b], [np.nan] * 3]
+    return np.array(out)
+
+
+def rover_box_edges(rover):
+    c = rover_corners(rover)
+    return [(c[a], c[b]) for a, b in EDGES]
 
 
 def main(folder):
@@ -45,15 +74,25 @@ def main(folder):
     title = str(d["title"])
     coll_seg = d["coll_seg"] if "coll_seg" in d.files else np.zeros((len(t), segs.shape[1]), bool)
     coll_text = d["coll_text"] if "coll_text" in d.files else np.array([""] * len(t))
+    rpose = d["rover_pose"] if "rover_pose" in d.files else np.zeros((len(t), 3))
+    show_objs = bool(d["show_objs"]) if "show_objs" in d.files else False
+    step = d["step"] if "step" in d.files else np.array([""] * len(t))
+    if show_objs:
+        obj_c, obj_R, obj_h, obj_col = d["obj_c"], d["obj_R"], d["obj_h"], d["obj_col"]
 
     # frames to draw at FPS_OUT
     times = np.arange(0.0, t[-1] + 1e-9, 1.0 / FPS_OUT)
     frames = np.searchsorted(t, times).clip(0, len(t) - 1)
 
     # scene limits from everything that moves + rover
-    pts = np.concatenate([segs.reshape(-1, 3), tcp, masses.reshape(-1, 3) if masses.size else tcp])
-    lo = np.minimum(pts.min(0), [rover[0] - rover[1], -rover[2] / 2, 0.0])
-    hi = np.maximum(pts.max(0), [rover[0], rover[2] / 2, rover[4]])
+    pts = [segs.reshape(-1, 3), tcp, masses.reshape(-1, 3) if masses.size else tcp]
+    pts += [rover_corners(rover, rpose[i]) for i in (0, len(t) - 1)]
+    if show_objs:
+        for k in range(obj_c.shape[1]):
+            pts += [obj_corners for obj_corners in (obb_corners(obj_c[i, k], obj_R[i, k], obj_h[k]) for i in (0, len(t) - 1))]
+    pts = np.concatenate(pts)
+    lo = np.minimum(pts.min(0), [np.inf, np.inf, 0.0])
+    hi = pts.max(0)
     ctr, half = (lo + hi) / 2, (hi - lo).max() / 2 + 0.1
 
     fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
@@ -63,13 +102,27 @@ def main(folder):
     fig.suptitle(f"{title}   ({folder.name})", fontsize=12)
     fig.subplots_adjust(left=0.03, right=0.97, top=0.9, bottom=0.08, hspace=0.45, wspace=0.15)
 
-    # --- 3D static scene
-    for a, b in rover_box_edges(rover):
-        ax3.plot(*zip(a, b), color="0.55", lw=1)
-    post3, = ax3.plot([0, 0], [0, 0], [rover[4], tt_h], color="0.3", lw=4)     # mount post (moves on a slide)
+    # --- 3D scene: rover body (moves if the rover drives), task objects
+    deck_h = rover[-1]
+    rpath0 = edge_path(rover_corners(rover, rpose[0]))
+    has_cop = "cop" in d.files
+    if has_cop:
+        wheels, cop, marg = d["wheels"], d["cop"], d["margin"]
+        foot3, = ax3.plot([], [], [], color="#2ca02c", lw=1.5)
+        cop3, = ax3.plot([], [], [], "o", color="#2ca02c", ms=7)
+        cops, = axs.plot([], [], "^", color="#2ca02c", ms=8)
+        tip_lbl = ax3.text2D(0.02, 0.85, "", transform=ax3.transAxes, fontsize=9)
+    rover3, = ax3.plot(rpath0[:, 0], rpath0[:, 1], rpath0[:, 2], color="0.55", lw=1)
+    objs3, objss = [], []
+    if show_objs:
+        for k in range(obj_c.shape[1]):
+            col = tuple(obj_col[k])
+            objs3.append(ax3.plot([], [], [], color=col, lw=1.2)[0])
+            objss.append(axs.plot([], [], color=col, lw=1.0)[0])
+    post3, = ax3.plot([0, 0], [0, 0], [rover[-1], tt_h], color="0.3", lw=4)     # mount post (moves on a slide)
     if prismatic.any():                                                      # rail on the deck
         y_lo, y_hi = base_pos[:, 1].min(), base_pos[:, 1].max()
-        ax3.plot([0, 0], [min(y_lo, -0.3) - 0.1, max(y_hi, 0.3) + 0.1], [rover[4]] * 2, color="0.35", lw=2)
+        ax3.plot([0, 0], [min(y_lo, -0.3) - 0.1, max(y_hi, 0.3) + 0.1], [rover[-1]] * 2, color="0.35", lw=2)
     g = np.linspace(-half, half, 5)
     for v in g:
         ax3.plot([ctr[0] + v] * 2, [ctr[1] - half, ctr[1] + half], [0, 0], color="0.85", lw=0.6)
@@ -80,8 +133,7 @@ def main(folder):
     ax3.view_init(elev=20, azim=-60)
 
     # --- side view static scene
-    nose, length, _, clear, deck = rover
-    axs.add_patch(plt.Rectangle((nose - length, clear), length, deck - clear, color="0.85"))
+    rovers, = axs.plot(rpath0[:, 0], rpath0[:, 2], color="0.6", lw=1)
     axs.axhline(0, color="0.5", lw=1)
     zlo = min(lo[2], 0.0) - 0.05
     span = max(hi[0] - lo[0], hi[2] - zlo) + 0.2           # same scale on both axes
@@ -93,7 +145,7 @@ def main(folder):
 
     # --- torque plot
     for k, n in enumerate(names):
-        if np.max(np.abs(tau[:, k])) < 0.5 and n in ("base_yaw", "base_slide", "gripper_yaw"):
+        if np.max(np.abs(tau[:, k])) < 0.5 and n in ("base_yaw", "base_slide", "wrist_roll"):
             continue  # skip idle base / yaw motors to keep the plot readable
         unit = "N" if prismatic[k] else "N*m"
         axt.plot(t, tau[:, k], color=COLORS[k], lw=1.6, label=f"{n} (limit {effort[k]:g} {unit})")
@@ -128,12 +180,34 @@ def main(folder):
     masss = axs.scatter(m0[:, 0], m0[:, 2], s=sizes, c=mcols, edgecolors="k", zorder=3)
     clock = ax3.text2D(0.02, 0.95, "", transform=ax3.transAxes)
     coll_lbl = fig.text(0.5, 0.93, "", ha="center", color="#d62728", fontsize=11, fontweight="bold")
+    step_lbl = ax3.text2D(0.02, 0.90, "", transform=ax3.transAxes, fontsize=9)
     writer = FFMpegWriter(fps=FPS_OUT, bitrate=4000)
     out = folder / "motion.mp4"
     with writer.saving(fig, str(out), dpi=100):
         for n, i in enumerate(frames):
             bp = base_pos[i]
-            post3.set_data_3d([bp[0], bp[0]], [bp[1], bp[1]], [rover[4], bp[2]])
+            post3.set_data_3d([bp[0], bp[0]], [bp[1], bp[1]], [rover[-1], bp[2]])
+            rp = edge_path(rover_corners(rover, rpose[i]))
+            rover3.set_data_3d(rp[:, 0], rp[:, 1], rp[:, 2])
+            rovers.set_data(rp[:, 0], rp[:, 2])
+            for k in range(len(objs3)):
+                op = edge_path(obb_corners(obj_c[i, k], obj_R[i, k], obj_h[k]))
+                objs3[k].set_data_3d(op[:, 0], op[:, 1], op[:, 2])
+                objss[k].set_data(op[:, 0], op[:, 2])
+            step_lbl.set_text(str(step[i]))
+            if has_cop:
+                cyw, syw = np.cos(rpose[i][2]), np.sin(rpose[i][2])
+                Rz = np.array([[cyw, -syw, 0], [syw, cyw, 0], [0, 0, 1]])
+                wp_ = wheels[[0, 1, 3, 2, 0]] @ Rz.T + np.array([rpose[i][0], rpose[i][1], 0.0])
+                col = "#2ca02c" if marg[i] > 0.05 else "#ff8c1a" if marg[i] >= 0 else "#d62728"
+                foot3.set_data_3d(wp_[:, 0], wp_[:, 1], wp_[:, 2])
+                foot3.set_color(col)
+                cop3.set_data_3d([cop[i, 0]], [cop[i, 1]], [0.0])
+                cop3.set_color(col)
+                cops.set_data([cop[i, 0]], [0.0])
+                cops.set_color(col)
+                tip_lbl.set_text(f"tip margin {marg[i]:+.2f} m")
+                tip_lbl.set_color(col)
             for s, (a, b) in enumerate(segs[i]):
                 col = "#d62728" if s < coll_seg.shape[1] and coll_seg[i, s] else "#1f5fbf"
                 tube3[s].set_data_3d(*zip(a, b))

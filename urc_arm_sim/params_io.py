@@ -46,10 +46,29 @@ def blocks_for(P):
     }
 
 
-def save(P, path):
+def task_blocks_for(P):
+    poses = ", ".join(f"{k}={_val(v)}" for k, v in P.ROVER_POSES.items())
+    return {"TASK": [
+        f"BOX_POSE = {_val(P.BOX_POSE)}",
+        f"BOX_GRASP = {_entry(P.BOX_GRASP)}",
+        f"DRAWER_GRASP = {_entry(P.DRAWER_GRASP)}",
+        f"ROVER_POSES = dict({poses})",
+    ]}
+
+
+def platform_blocks_for(P):
+    return {"PLATFORM": [
+        f"CHASSIS = {_entry(P.CHASSIS)}",
+        f"ARM_MOUNT = {_val(P.ARM_MOUNT)}",
+        f"WHEELS = {_entry(P.WHEELS)}",
+        f"SLOPE = {_entry(P.SLOPE)}",
+    ]}
+
+
+def save(P, path, blocks=None):
     path = Path(path)
     text = path.read_text()
-    for name, lines in blocks_for(P).items():
+    for name, lines in (blocks or blocks_for(P)).items():
         pat = re.compile(rf"(# >>> AUTO:{name}\n)(.*?)(# <<< AUTO:{name})", re.S)
         if not pat.search(text):
             raise ValueError(f"marker '# >>> AUTO:{name}' not found in {path.name}")

@@ -21,14 +21,13 @@ import math
 import numpy as np
 
 G = 9.81
-JOINT_ORDER = ["base", "shoulder", "elbow", "wrist_pitch", "gripper_yaw"]   # internal keys
+JOINT_ORDER = ["base", "shoulder", "elbow", "wrist_pitch", "gripper"]   # internal keys
 BODY_ORDER = ["base", "link1", "link2", "wrist", "gripper"]   # child of each joint
 TUBE_LINKS = ["link1", "link2"]
 JOINT_AXIS = {  # in the child frame ("base" depends on BASE_JOINT, see joint_axis)
     "shoulder": (0.0, -1.0, 0.0),
     "elbow": (0.0, -1.0, 0.0),
     "wrist_pitch": (0.0, -1.0, 0.0),
-    "gripper_yaw": (0.0, 0.0, 1.0),
 }
 
 
@@ -53,12 +52,29 @@ def joint_name(P, j):
     """Name used in the URDF, CSV and readout."""
     if j == "base":
         return "base_slide" if base_slides(P) else "base_yaw"
+    if j == "gripper":
+        return "wrist_roll"
     return j
 
 
+def internal_key(P, name):
+    """Internal joint key from an internal key or a joint name (e.g. 'wrist_roll' -> 'gripper')."""
+    if name in JOINT_ORDER:
+        return name
+    for j in JOINT_ORDER:
+        if joint_name(P, j) == name:
+            return j
+    if name in ("base_yaw", "base_slide"):
+        return "base"
+    raise KeyError(f"unknown joint '{name}'")
+
+
 def joint_axis(P, j):
+    j = internal_key(P, j)
     if j == "base":
         return (0.0, 1.0, 0.0) if base_slides(P) else (0.0, 0.0, 1.0)
+    if j == "gripper":   # wrist roll: about the gripper's own axis
+        return (1.0, 0.0, 0.0)
     return JOINT_AXIS[j]
 
 
@@ -138,16 +154,44 @@ def joint_origins(P):
     """Origin of each joint in its parent body's frame."""
     sx, sy, sz = P.SHOULDER_PIVOT
     return {
-        "base": (0.0, 0.0, P.BASE_HEIGHT),                      # in rover frame
+        "base": (0.0, 0.0, base_height(P)),                     # in rover frame
         "shoulder": (sx, sy, sz),                               # in base frame
         "elbow": (P.L1, link_geometry(P, "link1")["dy"], 0.0),  # in link1 frame
         "wrist_pitch": (P.L2, link_geometry(P, "link2")["dy"], 0.0),
-        "gripper_yaw": (0.0, 0.0, 0.0),
+        "gripper": (0.0, 0.0, 0.0),
     }
 
 
+def base_height(P):
+    """Top of the carriage / turntable above the ground."""
+    return P.CHASSIS["deck_height"] + P.BASE_ABOVE_DECK
+
+
 def shoulder_height(P):
-    return P.BASE_HEIGHT + P.SHOULDER_PIVOT[2]
+    return base_height(P) + P.SHOULDER_PIVOT[2]
+
+
+def rover_geom(P):
+    """Chassis geometry in the rover frame (origin on the ground under the arm mount)."""
+    C = P.CHASSIS
+    cx, cy = -P.ARM_MOUNT[0], -P.ARM_MOUNT[1]
+    return dict(center=(cx, cy), length=C["length"], width=C["width"], clearance=C["clearance"],
+                deck=C["deck_height"], nose=cx + C["length"] / 2)
+
+
+def wheel_points(P):
+    """Wheel contact points in the rover frame: FL, FR, RL, RR."""
+    g = rover_geom(P)
+    cx, cy = g["center"]
+    a, b = P.WHEELS["wheelbase"] / 2, P.WHEELS["track"] / 2
+    return np.array([[cx + a, cy + b, 0], [cx + a, cy - b, 0], [cx - a, cy + b, 0], [cx - a, cy - b, 0]])
+
+
+def gravity_vec(P):
+    """Gravity in the world frame (tilted for a slope)."""
+    S = getattr(P, "SLOPE", dict(deg=0.0, downhill_deg=0.0))
+    s, d = math.radians(S["deg"]), math.radians(S["downhill_deg"])
+    return G * np.array([math.sin(s) * math.cos(d), math.sin(s) * math.sin(d), -math.cos(s)])
 
 
 def lateral_offset(P):
@@ -243,16 +287,28 @@ def body_inertials(P, parts=None):
 # ------------------------------------------------------------------ kinematics
 def _rot(axis, q):
     c, s = math.cos(q), math.sin(q)
+    if axis[0] != 0:   # about +x (wrist roll)
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
     if axis[2] != 0:   # about +z
         return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
     return np.array([[c, 0, -s], [0, 1, 0], [s, 0, c]])   # about -y: x -> (c, 0, s)
 
 
-def fk(P, q, org=None):
-    """q: 5 joint angles (rad). Returns (frames body->(R,p), joints name->(axis,p), tcp)."""
+def rover_frame(rover=None):
+    """Rover pose (x, y, yaw_rad) on the ground -> (R, p) of the rover frame in the world."""
+    if rover is None:
+        return np.eye(3), np.zeros(3)
+    x, y, yaw = rover
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]), np.array([x, y, 0.0])
+
+
+def fk(P, q, org=None, rover=None):
+    """q: 5 joint values (rad, or m for a slide). rover: (x, y, yaw_rad) or None (= start pose).
+    Returns (frames body->(R,p), joints name->(axis,p), tcp), all in the world frame."""
     org = org or joint_origins(P)
-    R, p = np.eye(3), np.zeros(3)
-    frames, joints = {"rover": (np.eye(3), np.zeros(3))}, {}
+    R, p = rover_frame(rover)
+    frames, joints = {"rover": (R.copy(), p.copy())}, {}
     for j, body, qj in zip(JOINT_ORDER, BODY_ORDER, q):
         p = p + R @ np.array(org[j])
         ax = np.array(joint_axis(P, j))
@@ -266,30 +322,31 @@ def fk(P, q, org=None):
     return frames, joints, pg + Rg @ np.array([P.L_GRIPPER, 0, 0])
 
 
-def static_torques(P, q, inertials=None, org=None):
+def static_torques(P, q, inertials=None, org=None, rover=None):
     """Motor holding torques (N*m) about each joint axis, sign = joint positive direction.
     For a sliding base it is the holding force (N) along the slide: zero on a level rail."""
     inertials = inertials or body_inertials(P)
-    frames, joints, _ = fk(P, q, org)
+    frames, joints, _ = fk(P, q, org, rover=rover)
+    g = gravity_vec(P)
     coms = {b: frames[b][1] + frames[b][0] @ inertials[b]["com"] for b in BODY_ORDER}
     tau = np.zeros(len(JOINT_ORDER))
     for k, j in enumerate(JOINT_ORDER):
         a, pk = joints[j]
         if is_prismatic(P, j):
-            weight = sum(inertials[b]["mass"] for b in BODY_ORDER[k:]) * G
-            tau[k] = -np.dot(a, np.array([0, 0, -weight]))
+            weight = sum(inertials[b]["mass"] for b in BODY_ORDER[k:]) * g
+            tau[k] = -np.dot(a, weight)
             continue
         moment = np.zeros(3)
         for b in BODY_ORDER[k:]:
-            moment += np.cross(coms[b] - pk, np.array([0, 0, -inertials[b]["mass"] * G]))
+            moment += np.cross(coms[b] - pk, inertials[b]["mass"] * g)
         tau[k] = -np.dot(a, moment)
     return tau
 
 
-def skeleton(P, q, parts=None):
+def skeleton(P, q, parts=None, rover=None):
     """World-space points for drawing: tube segments, pivots, motor and extra COMs, TCP."""
     parts = parts or body_parts(P)
-    frames, joints, tcp = fk(P, q)
+    frames, joints, tcp = fk(P, q, rover=rover)
     segs = []
     for link in TUBE_LINKS:
         R, p = frames[link]
@@ -308,14 +365,17 @@ def skeleton(P, q, parts=None):
                 base_pos=frames["base"][1])
 
 
-def ik(P, xyz, pitch_deg, gripper_yaw_deg=0.0, elbow="up", q_current=None, collision_check=None):
-    """TCP target (world, m) with gripper pitch (deg) -> joint angles (rad) or (None, reason).
-    Base yaw turns the arm plane onto the target (accounting for sideways pivot offsets).
+def ik(P, xyz, pitch_deg, gripper_deg=0.0, elbow="up", q_current=None, collision_check=None,
+       rover=None):
+    """TCP target (world, m) with gripper pitch (deg) -> joint values or (None, reason).
+    The base (slide or turntable) brings the arm plane onto the target, allowing for
+    sideways pivot offsets. rover: the rover's pose (x, y, yaw_rad), None = start pose.
     collision_check: optional f(q) -> list of hits; colliding solutions are dropped and,
     if one elbow choice collides, the other is used."""
-    x, y, z = xyz
-    phi, psi = math.radians(pitch_deg), math.radians(gripper_yaw_deg)
-    c = lateral_offset(P) + P.L_GRIPPER * math.sin(psi)
+    R0, p0 = rover_frame(rover)
+    x, y, z = R0.T @ (np.asarray(xyz, float) - p0)          # target in the rover frame
+    phi, psi = math.radians(pitch_deg), math.radians(gripper_deg)
+    c = lateral_offset(P)        # the roll leaves the TCP on the gripper axis
     if base_slides(P):
         base = y - c                               # slide so the arm plane passes through the target
         r = x                                      # forward distance in the arm plane
@@ -326,7 +386,7 @@ def ik(P, xyz, pitch_deg, gripper_yaw_deg=0.0, elbow="up", q_current=None, colli
         r = math.sqrt(rxy * rxy - c * c)           # distance along the arm plane
         base = math.atan2(y, x) - math.atan2(c, r)
     sx, _, _ = P.SHOULDER_PIVOT
-    lg = P.L_GRIPPER * math.cos(psi)
+    lg = P.L_GRIPPER
     wx = r - lg * math.cos(phi) - sx
     wz = z - lg * math.sin(phi) - shoulder_height(P)
     cb = (wx * wx + wz * wz - P.L1**2 - P.L2**2) / (2 * P.L1 * P.L2)
@@ -379,7 +439,8 @@ def _wrap_into_limits(P, q, q_current=None):
 
 
 def home_q(P):
-    return [to_si(P, j, P.HOME_DEG[j]) for j in JOINT_ORDER]
+    H = P.HOME_DEG
+    return [to_si(P, j, H.get(j, H.get(joint_name(P, j), 0.0))) for j in JOINT_ORDER]
 
 
 # ------------------------------------------------------------------ collision checking
@@ -417,22 +478,21 @@ def collision_elements(P, parts=None):
                 els.append(dict(name=p["name"], body=body, kind="sphere", c=p["com"], r=max(p["size"]) / 2))
             elif p["kind"] == "payload":
                 els.append(dict(name="payload", body=body, kind="obb", c=p["com"], h=np.array(p["size"]) / 2))
-    R = P.ROVER
-    if base_slides(P):   # the post rides on the carriage (base frame origin is at BASE_HEIGHT)
+    deck, bh = P.CHASSIS["deck_height"], base_height(P)
+    if base_slides(P):   # the post rides on the carriage (base frame origin is at the base height)
         els.append(dict(name="mount post", body="base", chain=0, kind="capsule",
-                        a=np.array([0, 0, R["deck_height"] - P.BASE_HEIGHT + 0.04]),
-                        b=np.array([0, 0, -0.06]), r=0.04))
+                        a=np.array([0, 0, deck - bh + 0.04]), b=np.array([0, 0, -0.06]), r=0.04))
     else:
-        els.append(dict(name="mount post", body="rover", kind="capsule", a=np.array([0, 0, R["deck_height"]]),
-                        b=np.array([0, 0, P.BASE_HEIGHT - 0.04]), r=0.04))
+        els.append(dict(name="mount post", body="rover", kind="capsule", a=np.array([0, 0, deck]),
+                        b=np.array([0, 0, bh - 0.04]), r=0.04))
     return els
 
 
 def rover_box(P):
-    R = P.ROVER
-    nose = R["mount_behind_front"]
-    lo = np.array([nose - R["length"], -R["width"] / 2, R["ground_clearance"]])
-    hi = np.array([nose, R["width"] / 2, R["deck_height"]])
+    g = rover_geom(P)
+    cx, cy = g["center"]
+    lo = np.array([cx - g["length"] / 2, cy - g["width"] / 2, g["clearance"]])
+    hi = np.array([cx + g["length"] / 2, cy + g["width"] / 2, g["deck"]])
     return lo, hi
 
 
@@ -495,7 +555,7 @@ def _pt_obb(p, c, R, h):
 def _seg_obb(a, b, c, R, h):
     """Segment-to-box distance by ternary search (the distance is convex along the segment)."""
     lo_t, hi_t = 0.0, 1.0
-    for _ in range(40):
+    for _ in range(24):
         m1, m2 = lo_t + (hi_t - lo_t) / 3, hi_t - (hi_t - lo_t) / 3
         if _pt_obb(a + (b - a) * m1, c, R, h) < _pt_obb(a + (b - a) * m2, c, R, h):
             hi_t = m2
@@ -522,6 +582,21 @@ def _obb_aabb_overlap(c, R, h, lo, hi):
     return True
 
 
+def _obb_obb_overlap(c1, R1, h1, c2, R2, h2):
+    """Separating-axis test between two oriented boxes."""
+    T = c2 - c1
+    axes = [R1[:, i] for i in range(3)] + [R2[:, i] for i in range(3)]
+    axes += [np.cross(R1[:, i], R2[:, j]) for i in range(3) for j in range(3)]
+    for L in axes:
+        n = np.linalg.norm(L)
+        if n < 1e-9:
+            continue
+        L = L / n
+        if abs(T @ L) > np.sum(h1 * np.abs(R1.T @ L)) + np.sum(h2 * np.abs(R2.T @ L)):
+            return False
+    return True
+
+
 def _world(el, frames):
     R, p = frames[el["body"]]
     w = dict(el)
@@ -530,11 +605,26 @@ def _world(el, frames):
     elif el["kind"] == "sphere":
         w["c"] = p + R @ el["c"]
     else:
-        w["c"], w["R"] = p + R @ el["c"], R
+        w["c"], w["R"] = p + R @ el["c"], R @ el.get("R_local", np.eye(3))
     return w
 
 
+def _bsphere(w):
+    """Bounding sphere (centre, radius) of a world-space element, cached on the dict."""
+    if "_bs" not in w:
+        if w["kind"] == "capsule":
+            w["_bs"] = ((w["a"] + w["b"]) / 2, np.linalg.norm(w["b"] - w["a"]) / 2 + w["r"])
+        elif w["kind"] == "sphere":
+            w["_bs"] = (w["c"], w["r"])
+        else:
+            w["_bs"] = (w["c"], float(np.linalg.norm(w["h"])))
+    return w["_bs"]
+
+
 def _pair_hit(x, y, margin):
+    (cx, rx), (cy, ry) = _bsphere(x), _bsphere(y)
+    if np.linalg.norm(cx - cy) > rx + ry + margin:
+        return False
     kx, ky = x["kind"], y["kind"]
     if kx == "obb" and ky != "obb":
         x, y, kx, ky = y, x, ky, kx
@@ -550,7 +640,21 @@ def _pair_hit(x, y, margin):
         return _seg_obb(x["a"], x["b"], y["c"], y["R"], y["h"]) < x["r"] + margin
     if ky == "obb" and kx == "sphere":
         return _pt_obb(x["c"], y["c"], y["R"], y["h"]) < x["r"] + margin
+    if kx == "obb" and ky == "obb":
+        return _obb_obb_overlap(x["c"], x["R"], x["h"] + margin, y["c"], y["R"], y["h"])
     return False
+
+
+def _to_frame(w, R0, p0):
+    """World-space element -> the frame (R0, p0)."""
+    v = dict(w)
+    if w["kind"] == "capsule":
+        v["a"], v["b"] = R0.T @ (w["a"] - p0), R0.T @ (w["b"] - p0)
+    elif w["kind"] == "sphere":
+        v["c"] = R0.T @ (w["c"] - p0)
+    else:
+        v["c"], v["R"] = R0.T @ (w["c"] - p0), R0.T @ w["R"]
+    return v
 
 
 def _env_hit(w, lo, hi, margin):
@@ -565,7 +669,7 @@ def _env_hit(w, lo, hi, margin):
     else:
         corners = [w["c"] + w["R"] @ (w["h"] * np.array(s)) for s in
                    [(i, j, k2) for i in (-1, 1) for j in (-1, 1) for k2 in (-1, 1)]]
-        g = min(c[2] for c in corners) - margin < 0
+        g = min(c[2] for c in corners) - margin < -w.get("ground_tol", 0.0)
         rv = _obb_aabb_overlap(w["c"], w["R"], w["h"] + margin, lo, hi)
     return g, rv
 
@@ -591,11 +695,18 @@ def _fold_hit(x, y, margin):
     return _seg_seg(xs[0], xs[1], ys[0], ys[1]) < x["r"] + y["r"] + margin
 
 
-def check_collisions(P, q, elements=None, margin=None, frames=None):
-    """List of (part, other) pairs that touch in pose q. Empty list = clear."""
+def check_collisions(P, q, elements=None, margin=None, frames=None, rover=None, extra=None,
+                     scene=None, skip=None):
+    """List of (part, other) pairs that touch in pose q. Empty list = clear.
+    rover : rover pose (x, y, yaw_rad); extra: more arm elements (e.g. a held box, in the
+    gripper frame); scene: world-fixed boxes (task objects); skip(arm_part, scene_part) ->
+    True to ignore a pair (e.g. the gripper around a handle)."""
     elements = elements if elements is not None else collision_elements(P)
+    if extra:
+        elements = list(elements) + list(extra)
     margin = getattr(P, "COLLISION_MARGIN", 0.0) if margin is None else margin
-    frames = frames or fk(P, q)[0]
+    frames = frames or fk(P, q, rover=rover)[0]
+    R0, p0 = frames["rover"]
     W = [_world(e, frames) for e in elements]
     lo, hi = rover_box(P)
     hits = []
@@ -603,7 +714,7 @@ def check_collisions(P, q, elements=None, margin=None, frames=None):
     for w in W:
         if w["body"] == "rover" or ci(w) == 0:
             continue
-        g, rv = _env_hit(w, lo, hi, margin)
+        g, rv = _env_hit(_to_frame(w, R0, p0), lo, hi, margin)
         if g:
             hits.append((w["name"], "ground"))
         if rv and (ci(w) >= 2 or w["kind"] == "obb"):
@@ -626,6 +737,16 @@ def check_collisions(P, q, elements=None, margin=None, frames=None):
                 continue
             if _pair_hit(x, y, margin):
                 hits.append((x["name"], y["name"]))
+    if scene:
+        rover_obb = dict(name="rover body", kind="obb", c=p0 + R0 @ ((lo + hi) / 2), R=R0, h=(hi - lo) / 2)
+        for sc in scene:
+            if _pair_hit(rover_obb, sc, margin):
+                hits.append(("rover body", sc["name"]))
+            for w in W:
+                if skip is not None and skip(w["name"], sc["name"]):
+                    continue
+                if _pair_hit(w, sc, margin):
+                    hits.append((w["name"], sc["name"]))
     return hits
 
 
@@ -634,3 +755,102 @@ def describe_hits(hits, n=3):
         return "clear"
     s = "; ".join(f"{a} hits {b}" for a, b in hits[:n])
     return s + (f" (+{len(hits) - n} more)" if len(hits) > n else "")
+
+
+
+# ------------------------------------------------------------------ stability (tipping) and mount loads
+WHEEL_NAMES = ("FL", "FR", "RL", "RR")
+
+
+def mass_points(P, q, rover=None, inertials=None, parts=None):
+    """Every mass on the rover as (mass, world position): chassis, rover-mounted parts,
+    then the arm bodies (base onward). Returns (list, number of rover-side entries)."""
+    inertials = inertials or body_inertials(P)
+    parts = parts or body_parts(P)
+    frames = fk(P, q, rover=rover)[0]
+    R0, p0 = frames["rover"]
+    g = rover_geom(P)
+    cx, cy = g["center"]
+    C = P.CHASSIS
+    pts = [(C["mass"], p0 + R0 @ np.array([cx + C["com"][0], cy + C["com"][1], C["com"][2]]))]
+    for part in parts["rover"]:
+        pts.append((part["mass"], p0 + R0 @ part["com"]))
+    n_rover = len(pts)
+    for b in BODY_ORDER:
+        Rb, pb = frames[b]
+        pts.append((inertials[b]["mass"], pb + Rb @ inertials[b]["com"]))
+    return pts, n_rover
+
+
+def wheel_loads(P, rover, Fr, Mo):
+    """Ground normal force on each wheel (N; FL, FR, RL, RR) for the total ground reaction
+    Fr (world) with moment Mo about the world origin. Rocker-differential suspension:
+    the two side rockers carry equal moments about their pivots."""
+    R0, p0 = rover_frame(rover)
+    F = R0.T @ Fr
+    M = R0.T @ (Mo - np.cross(p0, Fr))          # about the rover origin, rover axes
+    w = wheel_points(P)
+    px = rover_geom(P)["center"][0] + P.WHEELS["pivot_x"]
+    A = np.array([
+        [1, 1, 1, 1],
+        w[:, 1],                                   # sum N y = Mx
+        -w[:, 0],                                  # -sum N x = My
+        [w[0, 0] - px, -(w[1, 0] - px), w[2, 0] - px, -(w[3, 0] - px)],   # left rocker = right rocker
+    ])
+    rhs = np.array([F[2], M[0], M[1], 0.0])
+    return np.linalg.solve(A, rhs), F, M
+
+
+def support_margin(P, cop):
+    """Distance (m) from the centre of pressure to the nearest edge of the wheel
+    footprint (rover frame), positive inside, and that edge's name."""
+    w = wheel_points(P)
+    x0, x1 = w[:, 0].min(), w[:, 0].max()
+    y0, y1 = w[:, 1].min(), w[:, 1].max()
+    d = {"front": x1 - cop[0], "rear": cop[0] - x0, "left": y1 - cop[1], "right": cop[1] - y0}
+    edge = min(d, key=d.get)
+    return d[edge], edge
+
+
+def stability(P, q, rover=None, inertials=None, parts=None, acc=None, extra_acc=None):
+    """Tipping check. acc: per-mass accelerations (world, list matching mass_points) or None
+    (static); extra_acc: a uniform acceleration of the whole rover (e.g. braking).
+    Returns dict(N, cop, margin, edge, lift, mount_F, mount_M, Fz)."""
+    pts, n_rover = mass_points(P, q, rover, inertials, parts)
+    g = gravity_vec(P)
+    Fr, Mo = np.zeros(3), np.zeros(3)
+    Fa, Ma = np.zeros(3), np.zeros(3)
+    R0, p0 = rover_frame(rover)
+    mount = p0 + R0 @ np.array([0, 0, P.CHASSIS["deck_height"]])
+    for i, (m, r) in enumerate(pts):
+        a = np.zeros(3) if acc is None else acc[i]
+        if extra_acc is not None:
+            a = a + extra_acc
+        f = m * (a - g)                         # force the support must supply to this mass
+        Fr += f
+        Mo += np.cross(r, f)
+        if i >= n_rover:                        # arm: carried by the mount
+            Fa += f
+            Ma += np.cross(r - mount, f)
+    N, F, M = wheel_loads(P, rover, Fr, Mo)
+    cop = np.array([-M[1] / F[2], M[0] / F[2]]) if F[2] > 1e-6 else np.array([np.nan, np.nan])
+    margin, edge = support_margin(P, cop)
+    return dict(N=N, cop=cop, margin=margin, edge=edge, lift=bool((N < 0).any()), Fz=F[2],
+                mount_F=R0.T @ Fa, mount_M=R0.T @ Ma)
+
+
+def drive_cases(P, rover=None):
+    """Uniform rover accelerations for the worst-case driving check (world)."""
+    a = P.DRIVE_ACCEL
+    R0, _ = rover_frame(rover)
+    return [R0 @ np.array(v) for v in ((a, 0, 0), (-a, 0, 0), (0, a, 0), (0, -a, 0))]
+
+
+def worst_drive(P, q, rover=None, inertials=None, parts=None, acc=None):
+    """Smallest margin over the drive cases (braking, accelerating, turning both ways)."""
+    worst = None
+    for ea in drive_cases(P, rover):
+        st = stability(P, q, rover, inertials, parts, acc, ea)
+        if worst is None or st["margin"] < worst["margin"]:
+            worst = st
+    return worst
