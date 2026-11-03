@@ -99,11 +99,19 @@ def main(folder):
     ax3 = fig.add_subplot(1, 2, 1, projection="3d")
     axs = fig.add_subplot(2, 2, 2)
     axt = fig.add_subplot(2, 2, 4)
-    fig.suptitle(f"{title}   ({folder.name})", fontsize=12)
+    design = str(d["design"]) if "design" in d.files else ""
+    fig.suptitle(f"{title}   ({folder.name})" + (f"   [{design}]" if design else ""), fontsize=12)
     fig.subplots_adjust(left=0.03, right=0.97, top=0.9, bottom=0.08, hspace=0.45, wspace=0.15)
 
     # --- 3D scene: rover body (moves if the rover drives), task objects
     deck_h = rover[-1]
+    has_defl = "defl_shape" in d.files
+    if has_defl:
+        dshape, dline, dtcp = d["defl_shape"], d["defl_line"], d["defl_tcp"]
+        dk = float(d["defl_scale"])
+        defl3 = [ax3.plot([], [], [], color="#e000e0", lw=1.2, ls="--")[0] for _ in range(dshape.shape[1])]
+        defls = [axs.plot([], [], color="#e000e0", lw=1.0, ls="--")[0] for _ in range(dshape.shape[1])]
+        dlbl = ax3.text2D(0.02, 0.80, "", transform=ax3.transAxes, fontsize=9, color="#b000b0")
     rpath0 = edge_path(rover_corners(rover, rpose[0]))
     has_cop = "cop" in d.files
     if has_cop:
@@ -195,6 +203,12 @@ def main(folder):
                 objs3[k].set_data_3d(op[:, 0], op[:, 1], op[:, 2])
                 objss[k].set_data(op[:, 0], op[:, 2])
             step_lbl.set_text(str(step[i]))
+            if has_defl:
+                for kk in range(dshape.shape[1]):
+                    pts_ = dline[i, kk] + dk * (dshape[i, kk] - dline[i, kk])
+                    defl3[kk].set_data_3d(pts_[:, 0], pts_[:, 1], pts_[:, 2])
+                    defls[kk].set_data(pts_[:, 0], pts_[:, 2])
+                dlbl.set_text(f"TCP deflection {dtcp[i]:.1f} mm (shape x{dk:g}, dashed)")
             if has_cop:
                 cyw, syw = np.cos(rpose[i][2]), np.sin(rpose[i][2])
                 Rz = np.array([[cyw, -syw, 0], [syw, cyw, 0], [0, 0, 1]])

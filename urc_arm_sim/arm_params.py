@@ -28,12 +28,12 @@ Values marked PLACEHOLDER are guesses; replace them when hardware is chosen.
 # ---------------------------------------------------------------- geometry
 # Pivot-to-pivot distances (axis to axis, in the plane of motion). These set
 # reach and the IK; the tube lengths follow from the pivot offsets below.
-L1 = .96            # shoulder axis -> elbow axis (m)  [team decision, Nov 2026]
-L2 = 0.88            # elbow axis -> wrist axis (m)     [team decision, Nov 2026]
+L1 = 1.0             # shoulder axis -> elbow axis (m)  [team decision, Nov 2026]
+L2 = 0.84            # elbow axis -> wrist axis (m)     [team decision, Nov 2026]
 L_GRIPPER = 0.15     # wrist axis -> TCP (m)
 
-BASE_JOINT = "yaw"     # "slide_y" (prismatic, along Y) or "yaw" (turntable about Z)
-BASE_ABOVE_DECK = 0.0     # top of the carriage / turntable bearing above the deck (m). PLACEHOLDER
+BASE_JOINT = "slide_y"     # "slide_y" (prismatic, along Y) or "yaw" (turntable about Z)
+BASE_ABOVE_DECK = 0.05     # top of the carriage / turntable bearing above the deck (m). PLACEHOLDER
 # Base height = deck height + BASE_ABOVE_DECK (0.55 m); shoulder height = base height +
 # SHOULDER_PIVOT z (0.6096 m, as in MATLAB). Raising the deck raises the arm.
 # Slide: the base frame starts at the mount and moves along +Y; the rail is drawn
@@ -53,7 +53,7 @@ BASE_ABOVE_DECK = 0.0     # top of the carriage / turntable bearing above the de
 #   SLOPE   : ground slope (deg) and the downhill direction (deg from +X, world).
 #             Simulated by tilting gravity (the view stays level).
 # >>> AUTO:PLATFORM
-CHASSIS = dict(length=1.0, width=0.8, clearance=0.15, deck_height=0.635, mass=30.0, com=(0.0, 0.0, 0.4))
+CHASSIS = dict(length=1.0, width=0.8, clearance=0.15, deck_height=0.5, mass=45.0, com=(0.0, 0.0, 0.3))
 ARM_MOUNT = (0.15, 0.0)
 WHEELS = dict(wheelbase=0.8, track=0.7, diameter=0.25, pivot_x=0.0)
 SLOPE = dict(deg=0.0, downhill_deg=0.0)
@@ -72,6 +72,13 @@ SECTION_MM = {
     "gripper": dict(width=25.4, height=25.4, wall=3.0),
 }
 WIRING_MASS = 0.1      # kg, spread by length over link1, link2, gripper [MATLAB m_electronics]
+# Other section types per link override SECTION_MM (see sections.py), e.g. the
+# braced corner-bar link 1 in arm_params_4bar.py. Empty = all rectangular tubes.
+LINK_SECTIONS = {}
+# Material for stiffness and stress (E, G in Pa; yield in MPa). 6061-T6 aluminium.
+MATERIAL = dict(E=69e9, G=26e9, yield_MPa=276.0)
+DESIGN_NAME = "tube link 1"
+DEFLECTION_SCALE = 10.0   # how much the drawn bent shape is exaggerated
 
 # ---------------------------------------------------------------- pivot locations
 # Where each axis sits relative to the TUBE, in the tube's own axes:

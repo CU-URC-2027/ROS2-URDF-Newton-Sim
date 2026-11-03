@@ -52,12 +52,12 @@ from newton import JointTargetMode
 
 import arm_model as am
 import build_urdf
+import deflection as dfl
 import mission as ms
 import params_io
 import scene as sc
 
 HERE = Path(__file__).resolve().parent
-PARAMS_FILE = HERE / "arm_params.py"
 BOX_EDGES = [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
 REACH_COLORS = [(0.1, 0.8, 0.2), (0.5, 0.5, 0.5), (0.9, 0.1, 0.1), (1.0, 0.6, 0.0), (0.6, 0.2, 0.9)]
 
@@ -82,7 +82,10 @@ class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
         sys.path.insert(0, str(HERE))
-        self.P = am.load_params("arm_params")
+        self.params_name = getattr(args, "params", None) or "arm_params"
+        self.P = am.load_params(self.params_name)
+        self.params_file = HERE / f"{self.params_name}.py"
+        self.show_defl, self.defl = True, None
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 10
@@ -111,6 +114,9 @@ class Example:
 
         nose = am.rover_geom(self.P)["nose"]
         self.presets = self.P.PRESETS          # edit them in arm_params.py
+        self.mission_presets = {}              # filled by Check mission (rover-relative poses)
+        self.carry, self.carry_rel, self.carry_note = False, None, ""
+        self.preset_sel = 0
         self.ik_target = [nose + 0.20, 0.0, 0.40, -45.0]
         self.elbow_up = True
 
@@ -170,6 +176,7 @@ class Example:
         self.model.set_gravity(tuple(float(v) for v in am.gravity_vec(P)))     # a slope tilts gravity
         self.solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
         self._mp_hist, self._acc = [], None
+        self._dp_hist, self._dacc = [], None
         self.stab, self.stab_drive = None, None
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -256,8 +263,15 @@ class Example:
         self.go_to(q, label)
         return np.array(q)
 
+    def all_presets(self):
+        out = dict(self.presets)
+        out.update({f"M {k}": v for k, v in self.mission_presets.items()})
+        return out
+
     def preset_q(self, name):
-        tgt = self.presets[name]
+        """Joint values for a preset. TCP targets are relative to the rover (its frame,
+        wherever it is now). Mission presets also bring their scene (drawer, box) with them."""
+        tgt = self.all_presets()[name]
         if isinstance(tgt, str):
             if tgt == "home":
                 return np.array(am.home_q(self.P))
@@ -265,10 +279,19 @@ class Example:
                 return np.zeros(5)
             self.status = f"{name}: unknown preset '{tgt}'"
             return None
+        R0, p0 = am.rover_frame(self.rover_state())
+        if isinstance(tgt, dict) and "tcp" in tgt:          # a mission pose
+            ref = self._si(tgt["joints_deg"])
+            q, msg = am.ik(self.P, p0 + R0 @ np.array(tgt["tcp"]), tgt["pitch"], tgt["roll"], "closest", ref,
+                           None, rover=self.rover_state())
+            if q is None:
+                self.status = f"{name}: {msg}"
+                return None
+            return np.array(q)
         if isinstance(tgt, dict):
             return self._si(tgt["joints_deg"])
-        q, msg = am.ik(self.P, tgt[:3], tgt[3], 0.0, "up" if self.elbow_up else "down", self.cmd,
-                       self._coll_fn(), rover=self.rover_state())
+        q, msg = am.ik(self.P, p0 + R0 @ np.array(tgt[:3], float), tgt[3], 0.0, "up" if self.elbow_up else "down",
+                       self.cmd, self._coll_fn(), rover=self.rover_state())
         if q is None:
             self.status = f"{name}: {msg}"
         return None if q is None else np.array(q)
@@ -331,6 +354,7 @@ class Example:
         else:
             self.hits = am.check_collisions(self.P, q, self.coll_elems, rover=r)
         self._update_stability(q, r)
+        self._update_deflection(q, r)
         self._record_step()
         if self.mission is not None:
             self._advance_mission()
@@ -340,6 +364,20 @@ class Example:
         q = self.state_0.joint_q.numpy()[self.idx].astype(float)
         qd = self.state_0.joint_qd.numpy()[self.idx].astype(float)
         return q, qd
+
+    def _update_deflection(self, q, r):
+        """Link bending / torsion and stress under the live loads (with accelerations)."""
+        pts = dfl.load_points(self.P, q, r, self.parts, dfl.box_load(self.P, self.att))
+        pos = pts[2]
+        if self._dp_hist and self._dp_hist[-1].shape != pos.shape:
+            self._dp_hist, self._dacc = [], None
+        self._dp_hist = (self._dp_hist + [pos])[-3:]
+        acc = None
+        if len(self._dp_hist) == 3:
+            a = (self._dp_hist[2] - 2 * self._dp_hist[1] + self._dp_hist[0]) / self.frame_dt ** 2
+            self._dacc = a if self._dacc is None else 0.6 * self._dacc + 0.4 * a
+            acc = self._dacc
+        self.defl = dfl.deflect(self.P, q, r, acc=acc, pts=pts)
 
     def _update_stability(self, q, r):
         """Tipping margin, wheel loads and mount loads, with the accelerations of every
@@ -355,6 +393,17 @@ class Example:
             acc = list(self._acc)
         self.stab = am.stability(self.P, q, r, ins, self.parts, acc)
         self.stab_drive = am.worst_drive(self.P, q, r, ins, self.parts, acc)
+
+    def _defl_record(self):
+        d = self.defl
+        b = {x["name"]: x for x in d["beams"]}
+        return dict(tcp_mm=d["tcp_mm"], down_mm=d["tcp_down_mm"],
+                    tip=[b[n]["tip_mm"] for n in ("link1", "link2", "gripper")],
+                    twist=[b[n]["twist_deg"] for n in ("link1", "link2", "gripper")],
+                    fos=[b[n]["fos"] for n in ("link1", "link2", "gripper")],
+                    mode=[b[n]["fos_mode"] for n in ("link1", "link2", "gripper")],
+                    shape=np.array([x["shape"] for x in d["beams"]]),
+                    line=np.array([x["line"] for x in d["beams"]]))
 
     def _stab_record(self, r):
         st, wd = self.stab, self.stab_drive
@@ -392,11 +441,39 @@ class Example:
             arr.assign(a)
         self.solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
 
+    # ================================================================ carrying the box
+    def _set_att(self, att):
+        """Change the task scene (box / drawer state) and the gripper's mass to match."""
+        self.att = att
+        self.carry = att["box"] == "gripper"
+        self._apply_grip_inertia()
+        self._mp_hist, self._acc = [], None
+        self._dp_hist, self._dacc = [], None
+
+    def set_carry(self, on):
+        """Put the task box in the gripper (as gripped in the pick-up) or back on the ground."""
+        att = ms.initial_state(self.P)
+        att.update(drawer_d=self.att["drawer_d"])
+        if on:
+            if self.carry_rel is None:
+                self.carry_rel, self.carry_note = ms.carry_grasp(self.P, np.array(am.home_q(self.P)),
+                                                                 self.coll_elems)
+            att.update(box="gripper", box_rel=self.carry_rel)
+        self._set_att(att)
+        self.status = (f"carrying the box ({self.P.TASK_BOX['mass']} kg, {self.carry_note})" if on
+                       else "box back on the ground")
+
+    def apply_preset_scene(self, name):
+        """A mission preset sets the scene as it was at that moment of the mission."""
+        tgt = self.all_presets().get(name)
+        if isinstance(tgt, dict) and "att" in tgt:
+            self._set_att(ms._copy_att(tgt["att"]))
+
     # ================================================================ task: box -> drawer
     def reset_task(self, q_start=None):
         """Box back on the ground at BOX_POSE, drawer closed, rover at the start, arm at home."""
         self.mission = None
-        self.att = ms.initial_state(self.P)
+        self.att, self.carry = ms.initial_state(self.P), False
         q = np.array(am.home_q(self.P)) if q_start is None else q_start
         self._build_model(q, np.zeros(3))
         self.cmd, self.cmd_qd = q.copy(), np.zeros(5)
@@ -436,6 +513,7 @@ class Example:
         if event in ("grip box", "release box"):
             self._apply_grip_inertia()
             self._mp_hist, self._acc = [], None   # the gripper's COM jumps; don't read that as acceleration
+            self._dp_hist, self._dacc = [], None
 
     def _advance_mission(self):
         sg = self.mission[self.mseg_i]
@@ -500,6 +578,12 @@ class Example:
         if b["kind"] == "check":
             ok, self.task_lines = r[0], r[1]
             self.status = "mission check: " + self.task_lines[0]
+            if r[2] is not None:
+                self.mission_presets, rel = ms.mission_presets(self.P, r[2])
+                if rel is not None:
+                    self.carry_rel, self.carry_note = rel, "as gripped in the mission"
+                self.task_lines = self.task_lines[:1] + [
+                    f"{len(self.mission_presets)} mission poses added to the presets (M ...)"] + self.task_lines[1:]
         elif b["kind"] == "rover poses":
             poses, lines = r
             if poses:
@@ -597,7 +681,7 @@ class Example:
         self.rec_log.append(dict(
             t=self.sim_time - self.rec_t0, cmd=self.cmd.copy(), q=q, qd=qd, tau=tau, sat=sat,
             static=am.static_torques(self.P, q, self.inertials_now(), rover=r), tcp=sk["tcp"], hits=list(self.hits),
-            stab=self._stab_record(r),
+            stab=self._stab_record(r), defl=self._defl_record(),
             base_pos=sk["base_pos"].copy(), rover=r, drawer=rs["drawer"], box_held=self.att["box"] == "gripper",
             step=(f"{sg.phase}: {sg.label}" if sg else ""),
             obj_c=np.array([o["c"] for o in objs]), obj_R=np.array([o["R"] for o in objs]),
@@ -619,7 +703,8 @@ class Example:
     def save_recording(self, make_video=True):
         P, log = self.P, self.rec_log
         name = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.rec_name) or "move"
-        folder = HERE / P.RECORD_DIR / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{name}"
+        tag = "" if self.params_name == "arm_params" else "_" + self.params_name.replace("arm_params_", "")
+        folder = HERE / P.RECORD_DIR / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{name}{tag}"
         folder.mkdir(parents=True, exist_ok=True)
 
         t = np.array([r["t"] for r in log])
@@ -644,6 +729,10 @@ class Example:
                                "drawer_open_m", "box_held", "tip_margin_m", "tip_edge", "tip_margin_driving_m",
                                "wheel_FL_N", "wheel_FR_N", "wheel_RL_N", "wheel_RR_N",
                                "mount_Fz_N", "mount_shear_N", "mount_bending_Nm", "mount_twist_Nm",
+                               "tcp_deflection_mm", "tcp_deflection_down_mm",
+                               "link1_tip_defl_mm", "link2_tip_defl_mm", "gripper_tip_defl_mm",
+                               "link1_twist_deg", "link2_twist_deg", "link1_safety_factor",
+                               "link2_safety_factor", "gripper_safety_factor",
                                "step", "collision"])
             for i in range(len(t)):
                 row = [f"{t[i]:.4f}"]
@@ -658,7 +747,11 @@ class Example:
                             int(log[i]["box_held"]), f"{sb['margin']:.4f}", sb["edge"], f"{sb['drive_margin']:.4f}"] +
                            [f"{v:.1f}" for v in sb["N"]] +
                            [f"{mF[2]:.1f}", f"{math.hypot(mF[0], mF[1]):.1f}", f"{math.hypot(mM[0], mM[1]):.2f}",
-                            f"{mM[2]:.2f}", log[i]["step"]] +
+                            f"{mM[2]:.2f}"] +
+                           [f"{log[i]['defl']['tcp_mm']:.3f}", f"{log[i]['defl']['down_mm']:.3f}"] +
+                           [f"{v:.3f}" for v in log[i]["defl"]["tip"]] +
+                           [f"{v:.4f}" for v in log[i]["defl"]["twist"][:2]] +
+                           [f"{min(v, 999):.2f}" for v in log[i]["defl"]["fos"]] + [log[i]["step"]] +
                            ["; ".join(f"{a} hits {b}" for a, b in HITS[i]) if HITS[i] else ""])
 
         lines = [f"Recording '{self.rec_name}'  {dt.datetime.now():%Y-%m-%d %H:%M:%S}",
@@ -673,7 +766,9 @@ class Example:
                       "Rover poses: " + ", ".join(f"{k} {v}" for k, v in P.ROVER_POSES.items())]
         else:
             lines += ["Start (deg; slide in m): " + self._fmt_pose(self.rec_start),
-                      "End   (deg; slide in m): " + self._fmt_pose(self.rec_end)]
+                      "End   (deg; slide in m): " + self._fmt_pose(self.rec_end),
+                      f"Carrying the task box ({P.TASK_BOX['mass']} kg): "
+                      + ("yes" if any(r["box_held"] for r in log) else "no")]
         lines += ["", f"{'motor':12s} {'peak |tau|':>10s} {'at t (s)':>9s} {'static peak':>11s} {'limit':>7s}  saturated"
                   + ("   during" if any(steps) else "")]
         for k, j in enumerate(self.names):
@@ -709,6 +804,18 @@ class Example:
                   + ("   LIFTS OFF" if NW[iw] < 0 else ""),
                   f"  arm mount: peak bending {bend[ib]:.1f} N*m at {t[ib]:.2f} s, peak vertical "
                   f"{max(b['mount_F'][2] for b in SB):.1f} N, peak twist {max(abs(b['mount_M'][2]) for b in SB):.1f} N*m"]
+        DF = [r["defl"] for r in log]
+        it = int(np.argmax([x["tcp_mm"] for x in DF]))
+        lines += ["", f"Deflection and stress ({getattr(P, 'DESIGN_NAME', '')}; links as beams, joints rigid):",
+                  f"  peak TCP deflection    {DF[it]['tcp_mm']:6.1f} mm (down {DF[it]['down_mm']:.1f}) at {t[it]:.2f} s"
+                  + (f"  ({steps[it]})" if steps[it] else "")]
+        for k, n in enumerate(("link1", "link2", "gripper")):
+            itk = int(np.argmax([x["tip"][k] for x in DF]))
+            ifk = int(np.argmin([x["fos"][k] for x in DF]))
+            tw = max(abs(x["twist"][k]) for x in DF)
+            lines.append(f"  {n:8s} tip {DF[itk]['tip'][k]:6.2f} mm, twist {tw:.3f} deg, least safety factor "
+                         f"{DF[ifk]['fos'][k]:.1f} ({DF[ifk]['mode'][k]}) at {t[ifk]:.2f} s"
+                         + ("   OVERSTRESSED" if DF[ifk]['fos'][k] < 1 else ""))
         lines += ["", "Collisions" + ("" if self.check_coll else " (checking was OFF)") + ":"]
         events, start = [], None
         for i in range(len(t) + 1):
@@ -737,9 +844,12 @@ class Example:
             turntable=np.array([am.base_height(P)]),
             wheels=am.wheel_points(P), cop=np.array([r["stab"]["cop_w"] for r in log]),
             margin=np.array([r["stab"]["margin"] for r in log]),
+            defl_shape=np.array([r["defl"]["shape"] for r in log]), defl_line=np.array([r["defl"]["line"] for r in log]),
+            defl_tcp=np.array([r["defl"]["tcp_mm"] for r in log]), defl_scale=np.array(getattr(P, "DEFLECTION_SCALE", 10.0)),
+            design=np.array(getattr(P, "DESIGN_NAME", "")),
             rover_pose=np.array([r["rover"] for r in log]),
             obj_c=np.array([r["obj_c"] for r in log]), obj_R=np.array([r["obj_R"] for r in log]),
-            obj_h=log[0]["obj_h"], obj_col=log[0]["obj_col"], show_objs=np.array(any(r["step"] for r in log)),
+            obj_h=log[0]["obj_h"], obj_col=log[0]["obj_col"], show_objs=np.array(any(r["step"] or r["box_held"] for r in log)),
             step=np.array([r["step"] for r in log]),
             coll_seg=np.array([[any(n in pair for pair in h) for n in ("link1 tube", "link2 tube", "gripper")]
                                for h in HITS]),
@@ -801,7 +911,7 @@ class Example:
             self.status = f"rejected: {e}"
 
     def save_design(self):
-        params_io.save(self.P, PARAMS_FILE)
+        params_io.save(self.P, self.params_file)
         path = build_urdf.write(self.P, HERE)
         self.dirty = False
         self.status = f"saved arm_params.py (backup .bak) and {path.name}"
@@ -918,10 +1028,29 @@ class Example:
                                    wp.array([0.025], dtype=wp.float32, device=dev),
                                    wp.array([wp.vec3(*col)], dtype=wp.vec3, device=dev))
 
+    def _draw_deflection(self):
+        """The arm's bent shape (magenta), exaggerated DEFLECTION_SCALE times."""
+        if not hasattr(self.viewer, "log_lines") or self.defl is None:
+            return
+        if not self.show_defl and not getattr(self, "_defl_drawn", False):
+            return
+        k = getattr(self.P, "DEFLECTION_SCALE", 10.0)
+        a, b = [], []
+        for bm in self.defl["beams"]:
+            pts = bm["line"] + k * (bm["shape"] - bm["line"])
+            a += list(pts[:-1])
+            b += list(pts[1:])
+        dev = self.model.device
+        self.viewer.log_lines("/deflection", wp.array(a, dtype=wp.vec3, device=dev), wp.array(b, dtype=wp.vec3, device=dev),
+                              wp.array([wp.vec3(1.0, 0.1, 0.9)] * len(a), dtype=wp.vec3, device=dev),
+                              hidden=not self.show_defl)
+        self._defl_drawn = True
+
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self._draw_stability()
+        self._draw_deflection()
         self._draw_task()
         self._draw_design_box()
         self._draw_collisions()
@@ -989,7 +1118,7 @@ class Example:
                         "The slope tilts gravity; the view stays level.")
         if ui.button("Save platform to arm_params.py##plat"):
             try:
-                params_io.save(P, PARAMS_FILE, params_io.platform_blocks_for(P))
+                params_io.save(P, self.params_file, params_io.platform_blocks_for(P))
                 build_urdf.write(P, HERE)
                 self.status = "saved platform to arm_params.py (backup .bak) and urc_arm.urdf"
             except Exception as e:
@@ -1069,7 +1198,7 @@ class Example:
                 self.status = "scene reset"
         if ui.button("Save task settings to arm_params.py##task"):
             try:
-                params_io.save(P, PARAMS_FILE, params_io.task_blocks_for(P))
+                params_io.save(P, self.params_file, params_io.task_blocks_for(P))
                 self.status = "saved task settings to arm_params.py (backup .bak)"
             except Exception as e:
                 self.status = f"save failed: {e}"
@@ -1101,7 +1230,7 @@ class Example:
         if changed_any:
             self.go_to(self._si(self.slider_val), "slider pose")
 
-        ui.text("Presets")
+        ui.text("Presets (TCP relative to the rover)")
         for name in self.presets:
             if ui.button(f"{name}##preset") and not busy:
                 q = self.preset_q(name)
@@ -1109,6 +1238,28 @@ class Example:
                     self.go_to(q, name)
             ui.same_line()
         ui.new_line()
+        ch, v = ui.checkbox(f"Carrying box ({self.P.TASK_BOX['mass']:g} kg)##carry", self.carry)
+        if ch and not busy:
+            self.set_carry(v)
+        names = list(self.all_presets())
+        self.preset_sel = min(self.preset_sel, len(names) - 1)
+        if self.mission_presets:
+            ui.text("Mission poses (from the last Check mission)")
+        else:
+            ui.text_wrapped("Check mission (Task section) to add its poses here")
+        _, self.preset_sel = ui.combo("##presetsel", self.preset_sel, names)
+        sel = names[self.preset_sel]
+        ui.same_line()
+        if ui.button("Go##presetsel") and not busy:
+            q = self.preset_q(sel)
+            if q is not None:
+                self.apply_preset_scene(sel)
+                self.go_to(q, sel)
+        tgt = self.all_presets()[sel]
+        if isinstance(tgt, dict) and "tcp" in tgt:
+            x, y, z = tgt["tcp"]
+            ui.text(f"  TCP ({x:.3f}, {y:.3f}, {z:.3f}) m, pitch {tgt['pitch']:.1f}, roll {tgt['roll']:.1f}"
+                    + ("  [box held]" if tgt["carry"] else ""))
 
         if ui.collapsing_header("TCP target / IK"):
             t = self.ik_target
@@ -1128,6 +1279,18 @@ class Example:
             ui.same_line()
             if ui.button("Set end = current pose##rec"):
                 self.rec_end = self.move_to.copy()
+            ui.text_wrapped(f"Preset selected above: {sel}")
+            if ui.button("Start = preset##rec") and not busy:
+                q = self.preset_q(sel)
+                if q is not None:
+                    self.apply_preset_scene(sel)     # a mission pose brings its scene (box held or not)
+                    self.rec_start = q
+            ui.same_line()
+            if ui.button("End = preset##rec") and not busy:
+                q = self.preset_q(sel)
+                if q is not None:
+                    self.rec_end = q
+            ui.text("Box: " + ("carried in the gripper" if self.carry else "not carried"))
             _, self.rec_name = ui.input_text("Name##rec", self.rec_name)
             if busy:
                 ui.text(f"... {self.rec_phase} ({len(self.rec_log)} frames)")
@@ -1201,6 +1364,16 @@ class Example:
             ui.pop_text_wrap_pos()
         else:
             ui.text_colored(ui.ImVec4(0.4, 0.9, 0.4, 1.0), "Collisions: clear")
+        if self.defl is not None:
+            d = self.defl
+            b = {x["name"]: x for x in d["beams"]}
+            col = (0.4, 0.9, 0.4, 1.0) if d["fos"] >= 2 else (1.0, 0.7, 0.2, 1.0) if d["fos"] >= 1 else (1.0, 0.3, 0.3, 1.0)
+            _, self.show_defl = ui.checkbox(f"Deflection ({getattr(P, 'DESIGN_NAME', '')}): TCP {d['tcp_mm']:.1f} mm "
+                                            f"(down {d['tcp_down_mm']:.1f})##defl", self.show_defl)
+            ui.text(f"  link1 tip {b['link1']['tip_mm']:.1f} mm, twist {b['link1']['twist_deg']:+.3f} deg | "
+                    f"link2 tip {b['link2']['tip_mm']:.1f} mm, twist {b['link2']['twist_deg']:+.3f} deg")
+            wb = min(d["beams"], key=lambda x: x["fos"])
+            ui.text_colored(ui.ImVec4(*col), f"  least safety factor {wb['fos']:.1f}: {wb['name']}, {wb['fos_mode']}")
         if self.stab is not None:
             st, wd = self.stab, self.stab_drive
             m = st["margin"]
@@ -1239,5 +1412,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--params", type=str, default="arm_params",
+                        help="design parameter file (module name), e.g. arm_params_4bar")
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

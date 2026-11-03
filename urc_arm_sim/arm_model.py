@@ -20,6 +20,8 @@ import math
 
 import numpy as np
 
+import sections
+
 G = 9.81
 JOINT_ORDER = ["base", "shoulder", "elbow", "wrist_pitch", "gripper"]   # internal keys
 BODY_ORDER = ["base", "link1", "link2", "wrist", "gripper"]   # child of each joint
@@ -233,11 +235,11 @@ def body_parts(P):
     tubes["gripper"] = (P.L_GRIPPER, np.array([P.L_GRIPPER / 2, 0, 0]), np.eye(3), 0.0)
     total_len = sum(t[0] for t in tubes.values())
     for body, (T, c, R, gam) in tubes.items():
-        s = P.SECTION_MM[body]
-        b, h, t = s["width"] / 1000, s["height"] / 1000, s["wall"] / 1000
-        m, I = _tube_inertia(P.DENSITY, T, b, h, t)
+        m, I = sections.mass_and_inertia(P, body, T)
+        b, h = sections.props(P, body)["envelope"]
         parts[body].append(dict(name=f"{body}_tube", kind="tube", mass=m, com=c, inertia=R @ I @ R.T,
-                                size=(T, b, h), rpy=(0.0, gam, 0.0)))
+                                size=(T, b, h), rpy=(0.0, gam, 0.0), R=R,
+                                section=sections.spec(P, body)["type"]))
         mw = P.WIRING_MASS * T / total_len
         if mw > 0:
             parts[body].append(dict(name=f"{body}_wiring", kind="wiring", mass=mw, com=c,
@@ -463,12 +465,10 @@ def collision_elements(P, parts=None):
     els = []
     for link in TUBE_LINKS:
         geo = link_geometry(P, link)
-        s = P.SECTION_MM[link]
         els.append(dict(name=f"{link} tube", body=link, kind="capsule", a=geo["start"], b=geo["end"],
-                        r=max(s["width"], s["height"]) / 2000))
-    s = P.SECTION_MM["gripper"]
+                        r=max(sections.props(P, link)["envelope"]) / 2))
     els.append(dict(name="gripper", body="gripper", kind="capsule", a=np.zeros(3),
-                    b=np.array([P.L_GRIPPER, 0, 0]), r=max(s["width"], s["height"]) / 2000))
+                    b=np.array([P.L_GRIPPER, 0, 0]), r=max(sections.props(P, "gripper")["envelope"]) / 2))
     for body, ps in parts.items():
         for p in ps:
             if p["kind"] == "motor":

@@ -35,14 +35,20 @@ presets) lives in **one file, `arm_params.py`**.
 
 | File | What it is |
 |---|---|
+| `arm_params_4bar.py` | The **4-bar link 1** design: same as `arm_params.py` but link 1 is four braced corner tubes (4.9). |
+| `arm_params_2bar.py` | The **2-bar link 1** design: link 1 is two braced tubes, one above the other, in the arm's plane (4.9). |
 | `arm_params.py` | **The file you edit.** Lengths, tube section and material, pivot offsets, joint limits / effort / speed, motors, extra masses, COM overrides, payload, home pose, preset targets. |
 | `sim_arm.py` | The simulation and its side panel (sliders, presets, IK, collision checking, recording, design editing). |
 | `arm_model.py` | The arm's math: geometry, mass properties, forward/inverse kinematics, static torques, collision checks. |
 | `build_urdf.py` | Writes `urc_arm.urdf` from the params and prints masses, tube lengths and holding torques. |
 | `make_video.py` | Turns a recording into an MP4 (the sim runs it automatically). |
+| `sections.py` | Link cross-sections (rectangular tube, laced or battened corner bars): stiffness, mass, stress. |
+| `deflection.py` | Link bending, torsion and stress under the live loads (4.9). |
+| `compare_designs.py` | Prints the designs side by side (tube, 4-bar, 2-bar by default): masses, stiffness, deflection, safety factors, torques, tipping. |
 | `scene.py` | Task objects: the box with its handle, the drawer cabinet and sliding tray. |
 | `mission.py` | The box → drawer mission: plan, check, rover-pose search, reach map. |
 | `params_io.py` | Writes design and task changes made in the sim back into `arm_params.py`. |
+| `urc_arm_4bar.urdf`, `urc_arm_2bar.urdf` | Generated URDFs of the 4-bar and 2-bar designs (`python build_urdf.py arm_params_4bar`). |
 | `urc_arm.urdf` | Generated robot description (for other tools, e.g. ROS). Regenerate with `python build_urdf.py`; don't edit by hand. |
 | `requirements.txt` | Python packages to install. |
 
@@ -203,7 +209,7 @@ box, type a value and press **Enter**.
 | **Status** | What the sim is doing, or why something failed (e.g. "out of reach"). |
 | **Check collisions** | Turns collision checking on/off (4.3). On by default. |
 | **Joints** | `base_slide` in **metres**; the other joints in **relative degrees** (what each motor turns). The arm moves there smoothly, limited by each joint's speed. |
-| **Presets** | Buttons for saved poses. Edit `PRESETS` in `arm_params.py`. |
+| **Presets** | Buttons for saved poses. Edit `PRESETS` in `arm_params.py`; their TCP coordinates are **relative to the rover** (its frame, wherever it is). Below them: **Carrying box** puts the 5 kg task box in the gripper (its mass, the drawn box and its collisions), and a drop-down that also holds the **mission poses** (`M …`) after a **Check mission** (4.4). |
 | **TCP target / IK** | Type a gripper-tip position (m) and pitch (deg; −90 = pointing down, 0 = level) and press **Solve IK**. The slide moves the arm sideways to line up with the target's Y (a turntable base turns to face it instead). **Elbow up** picks between the two arm solutions; if one collides, the other is used. |
 | **Record move** | Records a move from a start pose to an end pose (4.4). |
 | **Platform and stability** | Chassis size, deck height, mass and COM; arm mount position; wheels; slope (4.8). |
@@ -238,12 +244,30 @@ clearance (e.g. `0.01` = 1 cm). Untick **Check collisions** to turn it all off.
 3. Press **Record**. The arm goes to the start, settles for 1 s, makes the
    move, then holds for 0.5 s.
 
+Or pick poses from the preset drop-down and press **Start = preset** /
+**End = preset**. To record with the box, tick **Carrying box** first.
+
+**Mission poses.** Each **Check mission** that plans successfully adds the
+pose at the end of every arm move of the mission (e.g.
+`M pick_up: lift box`, `M place: move over the tray`) to the drop-down. Each one
+stores the TCP relative to the rover, the gripper pitch and wrist roll, and the
+scene at that moment: whether the box is in the gripper and how far the drawer
+is open. **Go** or **Start = preset** applies that scene too, so a pose taken
+while the box is held turns **Carrying box** on. The rover doesn't move; the
+drawer and cabinet stay where they are in the world, so collisions with them
+are only like the mission's if the rover is at that phase's pose (Task →
+**drive here**). The recorded move is a straight joint move from start to end,
+not the mission's path, which is the point: it shows what that shortcut would
+do (e.g. `lift box` → `move over the tray` sweeps the box through the open
+drawer; the mission raises the box first). Mission poses are kept until the
+next check; they aren't saved to `arm_params.py`.
+
 The result is saved in `recordings/<date>_<time>_<name>/`:
 
 | File | Content |
 |---|---|
-| `torques.csv` | One row per frame (60 per second). For each joint: commanded position, actual position, speed, **motor torque** (slide: force), static torque, saturated (0/1); the TCP position; and a `collision` column (empty = clear). Column names carry the units (`_deg`, `_m`, `_Nm`, `_N`). Opens in Excel. |
-| `summary.txt` | Each motor's peak torque, when it happens, the static peak, the limit, whether it saturated, and the time spans with collisions. |
+| `torques.csv` | One row per frame (60 per second). For each joint: commanded position, actual position, speed, **motor torque** (slide: force), static torque, saturated (0/1); the TCP position; tipping and wheel/mount loads; **deflection** (TCP total and downward, each link's tip deflection, twist and least safety factor); `box_held`; and a `collision` column (empty = clear). Column names carry the units (`_deg`, `_m`, `_Nm`, `_N`, `_mm`). Opens in Excel. |
+| `summary.txt` | Each motor's peak torque, when it happens, the static peak, the limit, whether it saturated; whether the box was carried; least tip margin, lightest wheel and mount loads; peak deflection and least safety factor per link; and the time spans with collisions. |
 | `motion.mp4` | 3D view, side view and a torque plot with a moving time cursor. Colliding parts turn red, a red banner names them, and collision times are shaded on the plot. Rendered in the background (10–30 s). Re-render with `python make_video.py recordings/<folder>`. |
 | `motion.npz`, `video_log.txt` | Data used by the video; the video's log (look here if the MP4 is missing). |
 
@@ -295,6 +319,9 @@ Open it in any text editor (`gedit arm_params.py` or VS Code). Sections:
 | `CHASSIS`, `ARM_MOUNT`, `WHEELS`, `SLOPE` | The platform (4.8): chassis box, mass and COM; where the arm is mounted on the deck; wheel layout; ground slope |
 | `BASE_ABOVE_DECK` | Top of the carriage / turntable above the deck (base height = deck + this) |
 | `DRIVE_ACCEL` | Braking / accelerating / turning acceleration for the worst-case tipping check |
+| `LINK_SECTIONS` | Other section types per link, overriding `SECTION_MM` (4.9) |
+| `MATERIAL` | E, G and yield strength for stiffness and stress |
+| `DESIGN_NAME`, `DEFLECTION_SCALE` | Label shown in the readout / recordings; how much the drawn bent shape is exaggerated |
 | `DENSITY`, `SECTION_MM`, `WIRING_MASS` | Tube material and rectangular cross-section (width, height, wall in mm; wall 0 = solid) |
 | `SHOULDER_PIVOT`, `LINK_GEOMETRY` | Pivot offsets (4.5). Default: link2 runs 4 cm to the left of link1 (side by side) |
 | `JOINTS` | Per joint: min, max (deg), effort limit (N·m), max speed (deg/s). `base_slide` uses metres, N and m/s; `base_yaw` is used only with the turntable |
@@ -412,6 +439,106 @@ arm mount, so moving the mount moves the chassis and wheels around it.
   while driving), and flags any step where the rover tips or a wheel lifts.
   **Find rover poses** rejects poses where the rover would tip.
 * `python build_urdf.py` prints the margins for the test poses.
+
+### 4.9 Link 1 designs, and deflection
+
+There are three design files; everything else is shared:
+
+| Design | File | URDF | Link 1 |
+|---|---|---|---|
+| Tube | `arm_params.py` | `urc_arm.urdf` | 25.4 × 25.4 × 3 mm aluminium tube |
+| 4-bar | `arm_params_4bar.py` | `urc_arm_4bar.urdf` | Four 10 × 10 × 1.5 mm square corner tubes on an 80 × 80 mm square, 10 × 3 mm flat-bar diagonal lacing every 150 mm on all four faces (placeholders) |
+| 2-bar | `arm_params_2bar.py` | `urc_arm_2bar.urdf` | Two 10 × 10 × 1.5 mm square tubes in the arm's plane, one 80 mm above the other, joined by 10 × 3 mm flat-bar diagonal lacing every 150 mm (placeholders) |
+
+```bash
+python sim_arm.py --params arm_params_4bar      # run the 4-bar design
+python build_urdf.py arm_params_4bar            # its URDF + summary
+python sim_arm.py --params arm_params_2bar      # run the 2-bar design
+python compare_designs.py                       # all three side by side
+```
+
+Saving from the sim writes back to whichever file you ran. Recordings of
+the 4-bar and 2-bar designs get `_4bar` / `_2bar` in their folder name. In the 4-bar file, link 2
+sits 6.5 cm to the side (instead of 4 cm) to clear the wider link 1, and
+link 1's bars start 6 cm out from the shoulder axis (the shoulder fitting
+fills the gap, clear of the mount post). The 2-bar file does the same at
+the shoulder, with link 2 back at 4 cm (link 1 is only 10 mm wide).
+
+The 4-bar section is set in `LINK_SECTIONS` (mm):
+
+```python
+LINK_SECTIONS = {"link1": dict(type="corner_bars", width=80, height=80, bar_w=10, bar_h=10, bar_wall=1.5,
+                               lace_w=10, lace_h=3, lace_wall=0, bay=150)}
+```
+
+`width` / `height` are bar centre spacings. The bars and the lacing are
+rectangular: `bar_w` across the arm × `bar_h` in the plane of motion,
+`lace_w` wide in the face × `lace_h` deep (out of the face); `wall` 0 = solid
+(so the lacing above is 10 × 3 mm flat bar). `bay` = lacing pitch. Any link
+can use it.
+
+**Battened** instead of laced: the same four bars, tied together by flat
+plates welded across all four faces at every station (one per `spacing`, plus
+both ends), so every bar is joined to its neighbours and each station is a
+closed rectangular frame. A commented example is in `arm_params_4bar.py`:
+
+```python
+"link1": dict(type="battened", width=80, height=80, bar_w=10, bar_h=10, bar_wall=1.5,
+              batten_w=20, batten_t=3, spacing=150)   # plate width along the link, thickness, pitch (mm)
+```
+
+Bending stiffness is the same as laced (the bars still act together), but
+shear and torsion are carried by the bars and plates bending between
+stations (frame action), which is much softer. With the placeholder sizes,
+straight out with the box: link 1 tip 3.8 mm vs 2.7 mm laced, link 1 twist
+0.78° vs 0.09°, and torsion stiffness GJ 319 N·m² (laced 2684, the single
+tube 877). Closer plates help; with wide spacing the bars buckle between
+plates.
+
+**Two bars in the arm's plane** (`arm_params_2bar.py`): two rectangular bars,
+one above the other, braced in that plane only:
+
+```python
+"link1": dict(type="two_bars", height=80, bar_w=10, bar_h=10, bar_wall=1.5,
+              bracing="laced", lace_w=10, lace_h=3, lace_wall=0, bay=150)
+# or bracing="battened", batten_w=20, batten_t=3, spacing=150
+```
+
+It is deep in the plane of motion, so in-plane bending is stiff (EI 11 348
+N·m², half the 4-bar's, 7× the tube's) at half the tube's mass. But
+sideways it is just two 10 mm bars (EI 87 N·m², 1/18 of the tube's), and it
+is an open section, so torsion is very soft (GJ 48 N·m², 1/18 of the tube's)
+and it can **buckle sideways** under in-plane bending (lateral-torsional
+buckling, checked with the classic $M_{cr}$ formula over the link length).
+Link 2 hangs 4 cm to the side, so it twists link 1 whenever the arm isn't
+straight. With the placeholder sizes: straight out with the box, TCP 29.6 mm,
+link 1 twist 3.1°, least safety factor 1.4 (lateral-torsional buckling); over
+the mission, peak TCP deflection 31.8 mm vs 12.7 mm (4-bar) and 68.8 mm
+(tube).
+
+**Deflection** (both designs) is shown:
+
+* in the readout: TCP deflection (and how much is downward), each link's tip
+  deflection and twist, and the **least safety factor** with what limits it
+  (tube yield; or for the 4-bar: corner-bar yield, corner-bar buckling
+  between lacing points, lacing yield or buckling; for battened: corner-bar
+  yield or buckling between battens, batten plate yield; for 2-bar: bar
+yield, bar buckling between bracing points, lacing or plate yield,
+lateral-torsional buckling). Tick the checkbox to
+  draw the **bent shape** (magenta), exaggerated `DEFLECTION_SCALE` times;
+* in recordings: `tcp_deflection_mm`, `tcp_deflection_down_mm`, each link's
+  tip deflection, link 1 and 2 twist, and each link's safety factor in the
+  CSV; a deflection section in `summary.txt`; the bent shape (dashed) in
+  the video;
+* in **Check mission** (peak TCP deflection, least safety factor; any
+  overstressed step is flagged) and in `build_urdf.py` (test poses, empty
+  and with the 5 kg box at the TCP).
+
+The sim's physics still uses rigid links, so the arm, the collision checks
+and the IK don't move by the deflection. The numbers say how far the real
+arm would sag; with the tube design and the box at full reach that's
+about 7 cm at the TCP, which matters for placing the box (`place_gap` is
+only 5 mm).
 
 ---
 
@@ -581,7 +708,59 @@ level. **Driving check:** the stability is recomputed with an extra uniform
 acceleration of `DRIVE_ACCEL` forward, backward, left and right, and the
 worst case is reported.
 
-### 5.10 Saving design changes
+### 5.10 Link sections and deflection
+
+**Sections** (`sections.py`), link frame: x along the link, y across the
+arm, z in the plane of motion.
+
+* Rectangular tube: the usual $I_y=(bh^3-b_ih_i^3)/12$ (in-plane),
+  $I_z=(hb^3-h_ib_i^3)/12$, Bredt torsion $J=4A_m^2t/p_m$, webs carrying
+  shear.
+* Braced corner bars (rectangular bars of area $A_b$, inertias $I_{b,y}$, $I_{b,z}$ at the corners of
+  a $w\times h$ rectangle; lacing of area $A_d$ at angle $\varphi$ to the
+  link axis, one diagonal per bay on each face):
+  * bending: $EI_y=E(4I_{b,y}+A_b h^2)$, $EI_z=E(4I_{b,z}+A_b w^2)$;
+  * shear stiffness of a laced face (Timoshenko, built-up members):
+    $S=EA_d\cos\varphi\sin^2\varphi$; two faces carry each shear direction;
+  * torsion: the four laced faces form a closed cell,
+    $GJ=4(wh)^2/\sum_i(b_i^2/S_i)$.
+  * stress: a corner bar carries $|N|/4+|M_y|/(2h)+|M_z|/(2w)$, checked for
+    yield and Euler buckling over one bay; a diagonal carries the face
+    shear (bending shear + torsion shear flow) times $d/b$, checked for yield
+    and buckling over its length.
+* Battened corner bars (plates of width $b_p$, thickness $t_p$ every $a$,
+  $I_p=t_pb_p^3/12$; EN 1993-1-1 §6.4.3):
+  * bending as laced;
+  * shear stiffness of a face with two chords $h_0$ apart:
+    $S_v=\dfrac{24EI_{ch}}{a^2\,(1+2I_{ch}h_0/(I_pa))}\le\dfrac{2\pi^2EI_{ch}}{a^2}$, with $I_{ch}$ the bar's $I$ for bending in that face;
+    torsion from the same closed-cell formula with these $S_v$;
+  * stress: a face's shear $V_f$ bends each bar by $V_fa/4$ between plates
+    (on top of its axial force; yield, and buckling over $a$ with that
+    bending) and each plate by $V_fa/2$ (with shear $V_fa/h_0$); welds are
+    not checked.
+* Two bars in the arm's plane, $h$ apart: $EI_y=E(2I_{b,y}+A_bh^2/2)$,
+  $EI_z=2EI_{b,z}$, $GJ=2GJ_b$ (open section), warping constant
+  $I_w=I_{b,z}h^2/2$; one braced face carries the in-plane shear (as above).
+  Lateral-torsional buckling:
+  $M_{cr}=\frac{\pi}{L}\sqrt{EI_zGJ}\sqrt{1+\frac{\pi^2EI_w}{GJL^2}}$ with
+  $L$ the link length (uniform moment; conservative for the arm's moment,
+  which is largest at the root).
+
+**Deflection** (`deflection.py`): link 1, link 2 and the gripper are beams
+along their pivot lines, each clamped at its proximal joint (joints and
+motors rigid). Every mass is a point load $m(\mathbf g-\mathbf a)$ (tubes
+split into pieces, a held box included, accelerations from the motion). At
+each station the internal force and moment come from all loads beyond it;
+integrating $\theta'=(M_x/GJ,M_y/EI_y,M_z/EI_z)$ and
+$u'=\theta\times\hat x+(0,V_y/S_y,V_z/S_z)$ gives each link's tip
+deflection and rotation, which carry the later links. Checked against
+hand calculations (tip load on a straight arm, torsion from the side
+offset, root stress): within 0.01 %.
+
+Not included: joint play and gearbox wind-up, the bars' end fittings, local
+buckling of the tube walls.
+
+### 5.11 Saving design changes
 
 `params_io.py` rewrites only the blocks between `# >>> AUTO:<NAME>` and
 `# <<< AUTO:<NAME>` in `arm_params.py` (pivots, motors, extra masses). It
@@ -634,6 +813,8 @@ git push
 
 ## 8. Limits and placeholders
 
+* **Deflection is calculated, not simulated:** the physics uses rigid
+  links; joints are rigid in the deflection model (4.9).
 * **Tipping is calculated, not simulated:** the rover never actually tips
   in the sim (its pose is held by the drive joints); the margin and wheel
   loads say when it would. Each body's rotational inertia is left out of the
@@ -651,7 +832,7 @@ git push
   in `arm_params.py`): motor masses and sizes, effort limits, joint speeds,
   base height, slide travel / force / speed, carriage mass, gripper actuator
   and camera masses, chassis mass and COM, wheelbase, track, wheel size,
-  rocker pivot, `DRIVE_ACCEL`.
+  rocker pivot, `DRIVE_ACCEL`, the 4-bar section sizes.
 * Joint limits default to ±180°; the slide to ±0.35 m.
 * The slide is assumed level: rover tilt (driving on a slope) isn't modelled,
   which would add a gravity load on the slide motor.

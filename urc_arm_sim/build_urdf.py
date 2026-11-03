@@ -12,6 +12,8 @@ from xml.sax.saxutils import escape
 import numpy as np
 
 import arm_model as am
+import deflection as dfl
+import sections
 
 COLORS = {
     "tube": "0.20 0.45 0.85 1", "motor": "0.95 0.55 0.10 1", "extra": "0.55 0.55 0.60 1",
@@ -143,6 +145,11 @@ def build(P, mobile=False):
             out.append(geom_xml("visual", f"{j}_axis", (0, 0, 0),
                                 '<cylinder radius="0.008" length="0.08"/>', "pivot", (math.pi / 2, 0, 0)))
         for p in parts[body]:
+            if p.get("section") in ("corner_bars", "battened", "two_bars"):   # draw the bars and the lacing / battens
+                for c, rpy, sz in sections.built_up_visuals(P, body, p["size"][0], p["R"], p["com"]):
+                    out.append(geom_xml("visual", f"{body}_bar", c, box(sz), "tube", rpy))
+                out.append(geom_xml("collision", p["name"], p["com"], box(p["size"]), "tube", p.get("rpy", (0, 0, 0))))
+                continue
             out.append(part_visuals(p))
             if p["kind"] in ("tube", "payload"):
                 out.append(geom_xml("collision", p["name"], p["com"], box(p["size"]), p["kind"],
@@ -205,6 +212,23 @@ def summary(P):
         print(f"  {name:32s}  {st['margin']:7.3f} {st['edge']:>6s}  {wd['margin']:8.3f} {wd['edge']:>6s}  "
               + " ".join(f"{n:6.0f}" for n in st["N"]))
     print("  (margin = centre of pressure to the nearest wheel-footprint edge; negative = tips over)")
+
+    print(f"\nLink sections ({getattr(P, 'DESIGN_NAME', '')}, E {P.MATERIAL['E'] / 1e9:.0f} GPa, "
+          f"yield {P.MATERIAL['yield_MPa']:.0f} MPa):")
+    for link, L in (("link1", P.L1), ("link2", P.L2), ("gripper", P.L_GRIPPER)):
+        pr = sections.props(P, link)
+        m, _ = sections.mass_and_inertia(P, link, L)
+        print(f"  {link:8s} {pr['type']:12s} {m:6.3f} kg  EI in-plane {pr['EIy']:8.0f}  out-of-plane {pr['EIz']:8.0f}"
+              f"  GJ {pr['GJ']:7.0f} N*m^2")
+    box = P.TASK_BOX["mass"]
+    print(f"\nDeflection and stress (static; with the {box:g} kg box at the TCP in the last column)")
+    print(f"  {'pose':32s}  {'TCP mm':>7s} {'link1 twist':>12s} {'min SF':>7s}   {'TCP mm + box':>12s} {'min SF + box':>12s}")
+    for name, q in poses.items():
+        d0 = dfl.deflect(P, q)
+        d1 = dfl.deflect(P, q, box=(box, np.array([P.L_GRIPPER, 0, 0])))
+        tw = [b["twist_deg"] for b in d0["beams"] if b["name"] == "link1"][0]
+        print(f"  {name:32s}  {d0['tcp_mm']:7.1f} {tw:10.3f} deg {d0['fos']:7.1f}   {d1['tcp_mm']:12.1f} "
+              f"{d1['fos']:7.1f} ({d1['fos_where']})")
 
 
 def write(P, folder=None):

@@ -24,6 +24,7 @@ import time
 import numpy as np
 
 import arm_model as am
+import deflection as dfl
 import scene as sc
 
 GRIP_PARTS = {"gripper", "gripper_mechanism", "camera"}
@@ -409,7 +410,7 @@ def replay(P, segs, att0, inertials, elems, dt=0.05, stop_on_problem=False):
     for sg in segs:
         rep = dict(phase=sg.phase, label=sg.label, T=sg.T, kind=sg.kind, collisions=set(), over_limit={},
                    jaw_deg=None, peak=np.zeros(5), margin=np.inf, edge="", lift=False,
-                   drive_margin=np.inf, drive_edge="")
+                   drive_margin=np.inf, drive_edge="", defl_mm=0.0, fos=np.inf, fos_where="")
         if sg.kind == "wait" and sg.at == "start":
             apply_event(P, sg.event, sg.q0, sg.r0, att)
         n = max(2, int(sg.T / dt) + 1) if sg.kind != "wait" else 2
@@ -424,6 +425,11 @@ def replay(P, segs, att0, inertials, elems, dt=0.05, stop_on_problem=False):
             if st["margin"] < rep["margin"]:
                 rep["margin"], rep["edge"] = st["margin"], st["edge"]
             rep["lift"] |= st["lift"]
+            if not stop_on_problem:     # link deflection and stress (static loads)
+                d = dfl.deflect(P, q, r, box=dfl.box_load(P, att))
+                rep["defl_mm"] = max(rep["defl_mm"], d["tcp_mm"])
+                if d["fos"] < rep["fos"]:
+                    rep["fos"], rep["fos_where"] = d["fos"], d["fos_where"]
             if sg.kind == "rover":      # driving: also check braking / turning
                 wd = am.worst_drive(P, q, r, ins)
                 if wd["margin"] < rep["drive_margin"]:
@@ -451,6 +457,67 @@ def replay(P, segs, att0, inertials, elems, dt=0.05, stop_on_problem=False):
     return reports, att
 
 
+# ------------------------------------------------------------------ mission poses as presets
+def _copy_att(att):
+    out = dict(att)
+    for k in ("box_T", "box_rel"):
+        if out.get(k) is not None:
+            out[k] = (np.array(out[k][0]).copy(), np.array(out[k][1]).copy())
+    return out
+
+
+def mission_presets(P, segs):
+    """The arm poses at the end of each arm move of a planned mission, as presets that are
+    relative to the rover: dict(name -> dict(tcp, pitch, roll, joints_deg, carry, att)).
+      tcp   : TCP in the rover frame (m)          pitch : absolute gripper pitch (deg)
+      roll  : wrist roll (deg)                    carry : the box is in the gripper
+      att   : the scene at that moment (drawer opening, where the box is)
+    Also returns the box's grasp transform (box_rel) of the first box grip, or None."""
+    att = initial_state(P)
+    out, carry_rel, seen = {}, None, {}
+    for sg in segs:
+        if sg.kind == "wait" and sg.at == "start":
+            apply_event(P, sg.event, sg.q0, sg.r0, att)
+        if sg.kind in ("joint", "linear") and sg.label != "stow":
+            q, r = sg.q(1.0), sg.rover(1.0)
+            R0, p0 = am.rover_frame(r)
+            tcp = R0.T @ (am.fk(P, q, rover=r)[2] - p0)
+            a = _copy_att(att)
+            if a["drawer_held"]:            # freeze the drawer where the arm left it
+                a.update(drawer_d=resolve(P, q, r, att)["drawer"], drawer_held=False)
+            name = f"{sg.phase}: {sg.label}"
+            seen[name] = seen.get(name, 0) + 1
+            if seen[name] > 1:
+                name += f" ({seen[name]})"
+            pitch = math.degrees(_wrap(q[1] + q[2] + q[3]))
+            out[name] = dict(tcp=tuple(round(float(v), 4) for v in tcp), pitch=round(pitch, 2),
+                             roll=round(math.degrees(q[4]), 2),
+                             joints_deg=[am.from_si(P, j, v) for j, v in zip(am.JOINT_ORDER, q)],
+                             carry=att["box"] == "gripper", att=a)
+        if sg.kind == "wait" and sg.at == "end":
+            apply_event(P, sg.event, sg.q0, sg.r0, att)
+        if carry_rel is None and att["box"] == "gripper":
+            carry_rel = (att["box_rel"][0].copy(), att["box_rel"][1].copy())
+    return out, carry_rel
+
+
+def carry_grasp(P, q_home, elems):
+    """box_rel for carrying the box: from planning the pick-up alone, or (if the box
+    can't be reached) the handle straight under a downward gripper."""
+    try:
+        _, pl = build_mission(P, q_home, elems, phases=("pick_up",))
+        if pl.att["box"] == "gripper":
+            return pl.att["box_rel"], "as gripped in the pick-up"
+    except PlanError:
+        pass
+    q = np.zeros(5)
+    q[3] = -math.pi / 2                                # straight out, gripper down
+    Rg, pg = am.fk(P, q)[0]["gripper"]
+    tcp = pg + Rg @ np.array([P.L_GRIPPER, 0, 0])
+    pb = tcp - sc.box_dims(P)["grasp"]
+    return (Rg.T, Rg.T @ (pb - pg)), "handle under the gripper (pick-up not reachable)"
+
+
 def summarize(P, reports, plan_error=None):
     """Short text lines for the panel / summary file."""
     lines = []
@@ -467,6 +534,8 @@ def summarize(P, reports, plan_error=None):
             notes.append(f"TIPS OVER toward the {r['edge']} ({r['margin']:.2f} m)")
         elif r.get("lift"):
             notes.append("a wheel lifts off")
+        if r.get("fos", np.inf) < 1.0:
+            notes.append(f"{r['fos_where']} OVERSTRESSED (safety factor {r['fos']:.2f})")
         if r.get("drive_margin", np.inf) < 0:
             notes.append(f"tips {r['drive_edge']} if braking/turning at {P.DRIVE_ACCEL} m/s^2 ({r['drive_margin']:.2f} m)")
         if r["jaw_deg"] is not None:
@@ -489,6 +558,11 @@ def summarize(P, reports, plan_error=None):
             head += f"; least tip margin {r['margin']:.2f} m ({r['edge']}, {r['label']})"
             if np.isfinite(min(dm)):
                 head += f", {min(dm):.2f} m while driving"
+        dmax = max(x.get("defl_mm", 0.0) for x in reports)
+        if dmax > 0:
+            j = int(np.argmax([x.get("defl_mm", 0.0) for x in reports]))
+            fmin = min(x.get("fos", np.inf) for x in reports)
+            head += f"; peak TCP deflection {dmax:.1f} mm ({reports[j]['label']}), least safety factor {fmin:.1f}"
     return ok, [head] + lines
 
 
