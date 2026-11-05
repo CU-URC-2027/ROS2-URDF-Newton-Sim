@@ -106,10 +106,10 @@ No GPU? The sim still runs on the CPU, just slower.
 sudo apt update
 sudo apt install git python3-venv python3-pip
 cd ~
-git clone https://github.com/<your-team>/<repo>.git
-cd <repo>/urc_arm_sim          # adjust to where this folder sits in the repo
+git clone https://github.com/CU-URC-2027/ROS2-URDF-Newton-Sim.git
+cd ROS2-URDF-Newton-Sim/urc_arm_sim          # adjust to where this folder sits in the repo
 ```
-
+May be better to just download this repo entirely, in the next sections, simply replace the CU-URC-2027/ROS2-URDF-Newton-Sim directories with wherever you installed and unzipped this repo
 ### 3.4 Python environment and Newton
 
 A **virtual environment** ("venv") is a private Python install for this
